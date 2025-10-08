@@ -9,6 +9,7 @@ from bson import ObjectId
 from datetime import datetime
 from pipeline_utils import kickoff_message_generation
 import re
+import time
 
 # -----------------------------
 # 1. ENV + Mongo Setup
@@ -44,199 +45,89 @@ class ClientRegistration(BaseModel):
     preferred_profession: str
     preferred_location: str
 
+class LinkedInInput(BaseModel):
+    searchQuery: str
+    profileScraperMode: str = "Full"  # default full
+    startPage: int = 1
+
 # -----------------------------
 # 3. Helper Functions
 # -----------------------------
 def clean_hashtag(tag):
-    """Clean hashtag to match Instagram's requirements: no spaces, special chars, etc."""
-    # Remove spaces and convert to lowercase
+    """Clean hashtag to match Instagram's requirements."""
     cleaned = re.sub(r'[^a-zA-Z0-9_]', '', tag.replace(' ', ''))
     return cleaned.lower()
 
 def run_apify(platform, search_terms, profession=None, preferred_location=None):
-    """Enhanced multi-platform Apify runner"""
-    
-    if platform == "instagram":
-        # For Instagram, we need clean hashtags without spaces or special characters
-        hashtags = []
-        
-        # Add base search terms as hashtags
-        for term in search_terms:
-            clean_tag = clean_hashtag(term)
-            if clean_tag and len(clean_tag) > 2:
-                hashtags.append(clean_tag)
-        
-        # Add profession-based hashtags
-        if profession:
-            prof_tag = clean_hashtag(profession)
-            if prof_tag and len(prof_tag) > 2:
-                hashtags.append(prof_tag)
-        
-        # Add location-based hashtags
-        if preferred_location:
-            loc_tag = clean_hashtag(preferred_location)
-            if loc_tag and len(loc_tag) > 2:
-                hashtags.append(loc_tag)
-        
-        # Add some cosmetic/beauty related hashtags
-        beauty_hashtags = ["makeup", "beauty", "cosmetics", "skincare", "makeupartist"]
-        for tag in beauty_hashtags:
-            if tag not in hashtags:
-                hashtags.append(tag)
-        
-        # Remove duplicates and limit to 10
-        hashtags = list(set(hashtags))[:10]
-        
-        actor_id = "apify/instagram-hashtag-scraper"
-        payload = {
-            "hashtags": hashtags, 
-            "resultsLimit": 20,  # Increased for better selection
-            "addParentData": False
-        }
-        
-    elif platform == "linkedin":
-        # For LinkedIn, construct search URLs or use profile scraper
-        search_queries = []
-        
-        # Build comprehensive search terms
-        for term in search_terms:
-            query = term
-            if profession:
-                query += f" {profession}"
-            if preferred_location:
-                query += f" {preferred_location}"
-            search_queries.append(query)
-        
-        # Add beauty industry specific terms
-        beauty_terms = ["cosmetics industry", "beauty marketing", "skincare specialist"]
-        for term in beauty_terms:
-            combined_term = term
-            if preferred_location:
-                combined_term += f" {preferred_location}"
-            search_queries.append(combined_term)
-        
-        actor_id = "curious_coder~linkedin-profile-scraper" 
-        payload = {
-            "startUrls": [{"url": f"https://www.linkedin.com/search/people/?keywords={query}"} for query in search_queries[:5]],
-            "maxItems": 15
-        }
-        
-    elif platform == "facebook":
-        # For Facebook, use people search with enhanced terms
-        search_queries = []
-        
-        for term in search_terms:
-            query = term
-            if profession:
-                query += f" {profession}"
-            if preferred_location:
-                query += f" {preferred_location}"
-            search_queries.append(query)
-        
-        # Add beauty-related searches
-        beauty_searches = ["beauty blogger", "makeup artist", "skincare enthusiast"]
-        for search in beauty_searches:
-            combined_search = search
-            if preferred_location:
-                combined_search += f" {preferred_location}"
-            search_queries.append(combined_search)
-            
-        actor_id = "scrapestorm~facebook-profiles-people-scraper"
-        payload = {
-            "startUrls": [{"url": f"https://www.facebook.com/search/people/?q={query}"} for query in search_queries[:5]],
-            "maxPosts": 15
-        }
-        
-    else:
-        raise ValueError(f"Unsupported platform: {platform}")
-
+    """Run Apify actors for Instagram, LinkedIn, and Facebook."""
     try:
-        print(f"🚀 Running {platform.upper()} actor {actor_id}")
-        print(f"📋 Payload: {payload}")
-        
+        # ---------------- Facebook ----------------
+        if platform == "facebook":
+            actor_id = "apify/facebook-search-scraper"
+            payload = {
+                    "categories": search_terms,
+                    "locations": [preferred_location],
+                    "resultsLimit": 20,
+                    "maxRequestRetries": 5,
+                    "proxy": {"apifyProxyGroups": ["RESIDENTIAL"]}
+                }
+
+
+        # ---------------- Instagram ----------------
+        elif platform == "instagram":
+            # Build dynamic hashtags
+            hashtags = [clean_hashtag(t) for t in search_terms if clean_hashtag(t)]
+
+            if profession:
+                hashtags.append(clean_hashtag(profession))
+            if preferred_location:
+                hashtags.append(clean_hashtag(preferred_location))
+
+            # Remove duplicates and empty strings
+            hashtags = list({t for t in hashtags if t})[:10]
+
+            actor_id = "apify/instagram-hashtag-scraper"
+            payload = {
+                "hashtags": hashtags,
+                "resultsLimit": 20,
+                "addParentData": False
+            }
+
+            print(f"📸 Using dynamic Instagram hashtags: {hashtags}")
+
+        # ---------------- LinkedIn ----------------
+        elif platform == "linkedin":
+            actor_id = "harvestapi/linkedin-profile-search"
+            payload = {
+                "searchQuery": " OR ".join(search_terms[:5]),
+                "profileScraperMode": "Full",
+                "startPage": 1,
+                "maxItems": 0,  # scrape all available profiles
+                "locations": [preferred_location] if preferred_location else []
+            }
+
+        else:
+            print(f"❌ Platform {platform} not supported")
+            return []
+
+        print(f"🚀 Running {platform.upper()} actor {actor_id} with payload: {payload}")
         actor_client = apify_client.actor(actor_id)
         run = actor_client.call(run_input=payload)
-        
-        if not run:
-            raise RuntimeError("Actor run returned no data")
+
+        if not run or "defaultDatasetId" not in run:
+            print(f"⚠️ {platform.upper()} actor returned no dataset")
+            return []
 
         dataset_client = apify_client.dataset(run["defaultDatasetId"])
-        items = dataset_client.list_items().items
-        
-        print(f"✅ Retrieved {len(items)} {platform.upper()} results from Apify")
+        items = list(dataset_client.iterate_items())
+        print(f"✅ Retrieved {len(items)} {platform.upper()} results")
         return items
-        
+
     except Exception as e:
         print(f"❌ Error running {platform.upper()} Apify actor: {e}")
-        raise HTTPException(status_code=500, detail=f"Apify client error for {platform}: {e}")
+        return []
 
-# -----------------------------
-# 4. Background Job
-# -----------------------------
-def fetch_and_store_audience_data():
-    """Enhanced background job to fetch data from all platforms"""
-    clients = clients_collection.find({})
-    
-    for client_data in clients:
-        try:
-            platform = client_data["platform"].lower()
-            print(f"🔄 Processing client: {client_data['name']} - Platform: {platform.upper()}")
-            
-            results = run_apify(
-                platform,
-                client_data["search_terms_with_location"],
-                client_data.get("preferred_profession"),
-                client_data.get("preferred_location")
-            )
-            
-            stored_count = 0
-            for r in results:
-                if not r:  # Skip empty results
-                    continue
-                    
-                r["client_id"] = str(client_data["_id"])
-                r["platform"] = platform
-                r["fetched_at"] = datetime.utcnow()
-                
-                # Create platform-specific unique identifier
-                unique_key = None
-                
-                if platform == "instagram":
-                    unique_key = r.get("id") or r.get("shortCode") or r.get("url")
-                elif platform == "linkedin":
-                    unique_key = r.get("profileUrl") or r.get("publicIdentifier") or r.get("fullName")
-                elif platform == "facebook":
-                    unique_key = r.get("profileUrl") or r.get("id") or r.get("name")
-                
-                if not unique_key:
-                    print(f"⚠️ Skipping {platform} record without unique identifier")
-                    continue
-
-                # Check for duplicates
-                existing_record = audience_collection.find_one({
-                    "client_id": str(client_data["_id"]), 
-                    "platform": platform,
-                    "unique_key": unique_key
-                })
-                
-                if not existing_record:
-                    r["unique_key"] = unique_key
-                    audience_collection.insert_one(r)
-                    stored_count += 1
-                    
-            print(f"✅ Stored {stored_count} new {platform.upper()} results for {client_data['name']}")
-            
-        except Exception as e:
-            print(f"❌ Error fetching {client_data.get('platform', 'unknown')} data for {client_data['name']}: {e}")
-
-# Schedule the job to run every 6 hours
-scheduler.add_job(fetch_and_store_audience_data, "interval", hours=6)
-
-# -----------------------------
-# 5. Helper Functions
-# -----------------------------
 def convert_objectids(obj):
-    """Helper to recursively convert ObjectIds to strings"""
     if isinstance(obj, ObjectId):
         return str(obj)
     elif isinstance(obj, dict):
@@ -248,109 +139,108 @@ def convert_objectids(obj):
     return obj
 
 # -----------------------------
-# 6. API Endpoints
+# 4. API Endpoints
 # -----------------------------
 @app.post("/register")
 def register_client(data: ClientRegistration):
-    """Register a new client with platform + search terms + profession + location."""
-    
-    # Validate platform
-    valid_platforms = ["instagram", "linkedin", "facebook"]
-    if data.platform.lower() not in valid_platforms:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid platform. Must be one of: {', '.join(valid_platforms)}"
-        )
-    
+    platform = data.platform.lower()
+    if platform not in ["instagram", "linkedin", "facebook"]:
+        raise HTTPException(status_code=400, detail="Invalid platform")
     client_info = data.dict()
-    client_info["platform"] = data.platform.lower()  # Normalize platform
+    client_info["platform"] = platform
     client_info["status"] = "registered"
     client_info["created_at"] = datetime.utcnow()
-    
     inserted_id = clients_collection.insert_one(client_info).inserted_id
-    
-    return {
-        "message": f"Client registered successfully for {data.platform.upper()}",
-        "client_id": str(inserted_id),
-        "platform": data.platform.lower(),
-        "next_steps": "Use /fetch-audience/{client_id} to collect prospect data"
-    }
+    return {"message": f"Client registered for {platform.upper()} successfully.", "client_id": str(inserted_id)}
 
 @app.post("/fetch-audience/{client_id}")
 def fetch_audience(client_id: str):
-    """Enhanced audience fetching for multiple platforms."""
-    try:
-        client_data = clients_collection.find_one({"_id": ObjectId(client_id)})
-        if not client_data:
-            raise HTTPException(status_code=404, detail="Client not found")
+    client_data = clients_collection.find_one({"_id": ObjectId(client_id)})
+    if not client_data:
+        raise HTTPException(status_code=404, detail="Client not found")
 
-        platform = client_data["platform"].lower()
-        print(f"🎯 Fetching {platform.upper()} audience for client: {client_data['name']}")
+    platform = client_data["platform"]
+    results = run_apify(platform, client_data["search_terms_with_location"], client_data.get("preferred_profession"), client_data.get("preferred_location"))
 
-        results = run_apify(
-            platform, 
-            client_data["search_terms_with_location"],
-            client_data.get("preferred_profession"),
-            client_data.get("preferred_location")
-        )
-        
-        stored_count = 0
-        skipped_count = 0
-        
-        for r in results:
-            if not r:  # Skip empty results
-                skipped_count += 1
-                continue
-                
-            r["client_id"] = str(client_data["_id"])
-            r["platform"] = platform
-            r["fetched_at"] = datetime.utcnow()
-            
-            # Create platform-specific unique key
-            unique_key = None
-            if platform == "instagram":
-                unique_key = r.get("id") or r.get("shortCode") or r.get("url")
-            elif platform == "linkedin":
-                unique_key = r.get("profileUrl") or r.get("publicIdentifier") or r.get("fullName")
-            elif platform == "facebook":
-                unique_key = r.get("profileUrl") or r.get("id") or r.get("name")
-            
-            if not unique_key:
-                skipped_count += 1
-                continue
-                
-            # Check for duplicates
-            if not audience_collection.find_one(
-                {"client_id": str(client_data["_id"]), "platform": platform, "unique_key": unique_key}
-            ):
-                r["unique_key"] = unique_key
-                audience_collection.insert_one(r)
-                stored_count += 1
-            else:
-                skipped_count += 1
+    stored_count = 0
+    for i, r in enumerate(results):
+        if not r:
+            continue
+        r["client_id"] = str(client_data["_id"])
+        r["platform"] = platform
+        r["fetched_at"] = datetime.utcnow()
+        unique_key = r.get("profileUrl") or r.get("publicIdentifier") or r.get("unique_key") or f"{platform}_{i}_{datetime.utcnow().timestamp()}"
+        r["unique_key"] = unique_key
+        if not audience_collection.find_one({"client_id": str(client_data["_id"]), "platform": platform, "unique_key": unique_key}):
+            audience_collection.insert_one(r)
+            stored_count += 1
 
-        # Update client status
-        clients_collection.update_one(
-            {"_id": client_data["_id"]}, 
-            {"$set": {
-                "status": "data_fetched", 
-                "data_fetched_at": datetime.utcnow(),
-                f"{platform}_profiles_count": stored_count
-            }}
-        )
-        
-        return {
-            "message": f"Successfully processed {platform.upper()} audience data",
-            "platform": platform,
-            "stored_new": stored_count,
-            "skipped_duplicates": skipped_count,
-            "total_processed": len(results),
-            "next_step": "Use /generate-messages/{client_id} to create personalized outreach"
-        }
+    status = "data_fetched" if stored_count else "data_fetch_attempted"
+    clients_collection.update_one({"_id": client_data["_id"]}, {"$set": {"status": status, "data_fetched_at": datetime.utcnow(), "last_fetch_count": stored_count}})
+    return {"message": f"Fetched {stored_count} {platform.upper()} items.", "stored_count": stored_count}
+
+
+def fetch_and_store_audience_data():
+    """Background job for Instagram, Facebook, and LinkedIn with LinkedIn defaults."""
+    clients = clients_collection.find({})
     
-    except Exception as e:
-        print(f"❌ Error in fetch_audience: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    for client_data in clients:
+        try:
+            platform = client_data["platform"].lower()
+            print(f"🔄 Background job processing: {client_data['name']} - Platform: {platform.upper()}")
+
+            # ---------------- Run Apify ----------------
+            results = run_apify(
+                platform,
+                client_data.get("search_terms_with_location", []),
+                client_data.get("preferred_profession"),
+                client_data.get("preferred_location")
+            )
+
+            if not results:
+                print(f"⚠️ No results found for {client_data['name']} on {platform.upper()}")
+                continue
+
+            stored_count = 0
+            for i, r in enumerate(results):
+                if not r:
+                    continue
+
+                r["client_id"] = str(client_data["_id"])
+                r["platform"] = platform
+                r["fetched_at"] = datetime.utcnow()
+
+                # ---------------- Unique Key ----------------
+                if platform == "linkedin":
+                    unique_key = r.get("profileUrl") or r.get("publicIdentifier") or f"li_{i}_{datetime.utcnow().timestamp()}"
+                elif platform == "instagram":
+                    unique_key = r.get("id") or r.get("shortCode") or r.get("url") or f"ig_{i}_{datetime.utcnow().timestamp()}"
+                elif platform == "facebook":
+                    unique_key = r.get("unique_key") or f"fb_{i}_{datetime.utcnow().timestamp()}"
+                else:
+                    unique_key = f"{platform}_{i}_{datetime.utcnow().timestamp()}"
+
+                r["unique_key"] = unique_key
+
+                # ---------------- Avoid Duplicates ----------------
+                existing_record = audience_collection.find_one({
+                    "client_id": str(client_data["_id"]),
+                    "platform": platform,
+                    "unique_key": unique_key
+                })
+
+                if not existing_record:
+                    audience_collection.insert_one(r)
+                    stored_count += 1
+
+            print(f"✅ Background job stored {stored_count} new {platform.upper()} results for {client_data['name']}")
+
+        except Exception as e:
+            print(f"❌ Background job error for {client_data.get('name', 'unknown')}: {e}")
+            continue
+
+# Schedule the job every 6 hours
+scheduler.add_job(fetch_and_store_audience_data, "interval", hours=6)
 
 @app.post("/generate-messages/{client_id}")
 def generate_messages(client_id: str):
@@ -360,7 +250,9 @@ def generate_messages(client_id: str):
         if not client_data:
             raise HTTPException(status_code=404, detail="Client not found")
             
-        if client_data.get("status") != "data_fetched":
+        # Accept both "data_fetched" and "data_fetch_attempted" statuses
+        valid_statuses = ["data_fetched", "data_fetch_attempted"]
+        if client_data.get("status") not in valid_statuses:
             raise HTTPException(
                 status_code=400, 
                 detail="Audience data not fetched yet. Please run /fetch-audience first."
@@ -433,42 +325,19 @@ def get_audience_data(client_id: str):
         platform = client_data["platform"].lower()
 
         # Fetch platform-specific audience data
-        audience_data = list(audience_collection.find(
-            {"client_id": client_id, "platform": platform}, 
-            {"_id": 0}
-        ).limit(10))  # Limit to 10 for display
-        
+        audience_data = list(
+            audience_collection.find(
+                {"client_id": client_id, "platform": platform}, 
+                {"_id": 0}
+            )
+            .sort("fetched_at", -1)   # newest first
+            .limit(10)
+        )
+
         total_count = audience_collection.count_documents({
             "client_id": client_id, 
             "platform": platform
         })
-        
-        # Get platform-specific stats
-        platform_stats = {}
-        if platform == "instagram":
-            platform_stats = {
-                "avg_likes": audience_collection.aggregate([
-                    {"$match": {"client_id": client_id, "platform": platform}},
-                    {"$group": {"_id": None, "avg_likes": {"$avg": "$likesCount"}}}
-                ]),
-                "total_hashtags": len(set([tag for doc in audience_data for tag in doc.get("hashtags", [])]))
-            }
-        elif platform == "linkedin":
-            platform_stats = {
-                "industries": list(set([doc.get("industry", "") for doc in audience_data if doc.get("industry")])),
-                "avg_connections": audience_collection.aggregate([
-                    {"$match": {"client_id": client_id, "platform": platform}},
-                    {"$group": {"_id": None, "avg_connections": {"$avg": "$connectionsCount"}}}
-                ])
-            }
-        elif platform == "facebook":
-            platform_stats = {
-                "locations": list(set([doc.get("location", "") for doc in audience_data if doc.get("location")])),
-                "avg_friends": audience_collection.aggregate([
-                    {"$match": {"client_id": client_id, "platform": platform}},
-                    {"$group": {"_id": None, "avg_friends": {"$avg": "$friendsCount"}}}
-                ])
-            }
         
         return {
             "client_id": client_id,
@@ -476,8 +345,8 @@ def get_audience_data(client_id: str):
             "platform": platform.upper(),
             "total_profiles": total_count,
             "sample_profiles": audience_data,
-            "platform_stats": platform_stats,
-            "status": client_data.get("status", "unknown")
+            "status": client_data.get("status", "unknown"),
+            "last_fetch_count": client_data.get("last_fetch_count", 0)
         }
         
     except Exception as e:
@@ -507,6 +376,7 @@ def get_client_status(client_id: str):
             "data_fetched_at": client_data.get("data_fetched_at"),
             "messages_generated_at": client_data.get("messages_generated_at"),
             "audience_profiles_count": audience_count,
+            "last_fetch_count": client_data.get("last_fetch_count", 0),
             "search_terms": client_data.get("search_terms_with_location", []),
             "preferred_profession": client_data.get("preferred_profession"),
             "preferred_location": client_data.get("preferred_location")
@@ -525,15 +395,23 @@ def get_client_status(client_id: str):
 @app.get("/")
 def root():
     return {
-        "message": "🚀 Multi-Platform Personalized Outreach Engine",
+        "message": "🚀 Multi-Platform Personalized Outreach Engine - FIXED VERSION",
         "supported_platforms": ["Instagram", "LinkedIn", "Facebook"],
         "pipeline": "4-Step Flow → Register Client → Fetch Audience → Generate Messages → Track Results",
+        "improvements": [
+            "✅ Better error handling for failed scrapers",
+            "✅ Multiple Facebook scraper fallbacks", 
+            "✅ Timeout handling for long-running actors",
+            "✅ Empty result handling without crashes",
+            "✅ Enhanced logging and debugging"
+        ],
         "endpoints": {
             "POST /register": "Register a new client with platform, profession, location, and search terms",
             "POST /fetch-audience/{client_id}": "Run Apify and store platform-specific audience data",
             "POST /generate-messages/{client_id}": "Generate personalized outreach messages",
             "GET /audience/{client_id}": "View stored audience data with platform stats",
-            "GET /client/{client_id}/status": "Get detailed client status and progress"
+            "GET /client/{client_id}/status": "Get detailed client status and progress",
+            "GET /test-platform/{platform}": "Test individual platform scraping"
         },
-        "status": "✅ Ready to process multi-platform outreach requests"
+        "status": "✅ Ready to process multi-platform outreach requests with improved reliability"
     }

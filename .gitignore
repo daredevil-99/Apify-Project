@@ -23,3 +23,8 @@ Thumbs.db
 # Ignore dataset files
 dataset_*.csv
 owner_ids.csv
+facebook_profiles.csv
+
+# Ignore scripts you don't want tracked
+facebook_scraper.py
+main.py
