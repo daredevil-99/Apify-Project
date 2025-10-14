@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
@@ -7,9 +7,15 @@ import os
 import pymongo
 from bson import ObjectId
 from datetime import datetime
-from pipeline_utils import kickoff_message_generation
+from uuid import uuid4
 import re
 import time
+import threading
+import uuid
+from pipeline_utils import kickoff_message_generation
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 
 # -----------------------------
 # 1. ENV + Mongo Setup
@@ -34,13 +40,18 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 
 # -----------------------------
-# 2. Models
+# 2. Global Task Tracker
+# -----------------------------
+tasks = {}  # store running background jobs
+
+# -----------------------------
+# 3. Models
 # -----------------------------
 class ClientRegistration(BaseModel):
     name: str
     role: str
     email: str
-    platform: str  # linkedin / instagram / facebook
+    platform: str
     search_terms_with_location: list[str]
     preferred_profession: str
     preferred_location: str
@@ -50,9 +61,6 @@ class LinkedInInput(BaseModel):
     profileScraperMode: str = "Full"  # default full
     startPage: int = 1
 
-# -----------------------------
-# 3. Helper Functions
-# -----------------------------
 def clean_hashtag(tag):
     """Clean hashtag to match Instagram's requirements."""
     cleaned = re.sub(r'[^a-zA-Z0-9_]', '', tag.replace(' ', ''))
@@ -127,198 +135,337 @@ def run_apify(platform, search_terms, profession=None, preferred_location=None):
         print(f"❌ Error running {platform.upper()} Apify actor: {e}")
         return []
 
-def convert_objectids(obj):
-    if isinstance(obj, ObjectId):
-        return str(obj)
-    elif isinstance(obj, dict):
-        return {k: convert_objectids(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_objectids(item) for item in obj]
-    elif isinstance(obj, datetime):
-        return obj.isoformat()
-    return obj
-
 # -----------------------------
-# 4. API Endpoints
+# 4. Register Client with UUID
 # -----------------------------
 @app.post("/register")
 def register_client(data: ClientRegistration):
     platform = data.platform.lower()
     if platform not in ["instagram", "linkedin", "facebook"]:
         raise HTTPException(status_code=400, detail="Invalid platform")
+
+    client_id = str(uuid4())  # generate permanent unique client_id
     client_info = data.dict()
+    client_info["client_id"] = client_id
     client_info["platform"] = platform
     client_info["status"] = "registered"
     client_info["created_at"] = datetime.utcnow()
-    inserted_id = clients_collection.insert_one(client_info).inserted_id
-    return {"message": f"Client registered for {platform.upper()} successfully.", "client_id": str(inserted_id)}
 
+    clients_collection.insert_one(client_info)
+    return {"message": f"Client registered for {platform.upper()} successfully.", "client_id": client_id}
+
+
+# -----------------------------
+# 5. Background Task Function
+# -----------------------------
+def run_fetch_audience_task(task_id: str, client_id: str):
+    try:
+        tasks[task_id]["status"] = "running"
+        client_data = clients_collection.find_one({"client_id": client_id})
+        if not client_data:
+            raise Exception("Client not found")
+
+        platform = client_data["platform"]
+        results = run_apify(
+            platform,
+            client_data["search_terms_with_location"],
+            client_data.get("preferred_profession"),
+            client_data.get("preferred_location"),
+        )
+
+        stored_count = 0
+        for i, r in enumerate(results):
+            if not r:
+                continue
+            r["client_id"] = client_id
+            r["platform"] = platform
+            r["fetched_at"] = datetime.utcnow()
+            unique_key = (
+                r.get("profileUrl")
+                or r.get("publicIdentifier")
+                or r.get("unique_key")
+                or f"{platform}_{i}_{datetime.utcnow().timestamp()}"
+            )
+            r["unique_key"] = unique_key
+            if not audience_collection.find_one(
+                {"client_id": client_id, "platform": platform, "unique_key": unique_key}
+            ):
+                audience_collection.insert_one(r)
+                stored_count += 1
+
+        status = "data_fetched" if stored_count else "data_fetch_attempted"
+        clients_collection.update_one(
+            {"client_id": client_id},
+            {
+                "$set": {
+                    "status": status,
+                    "data_fetched_at": datetime.utcnow(),
+                    "last_fetch_count": stored_count,
+                }
+            },
+        )
+
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["result"] = {"stored_count": stored_count, "platform": platform}
+
+    except Exception as e:
+        tasks[task_id]["status"] = f"failed: {str(e)}"
+
+    finally:
+        # Clean up old task data
+        print(f"🧹 Cleaning up task {task_id}")
+        time.sleep(2)  # slight delay for visibility
+        del tasks[task_id]
+
+
+# -----------------------------
+# 6. Async Endpoint with Task ID
+# -----------------------------
 @app.post("/fetch-audience/{client_id}")
-def fetch_audience(client_id: str):
-    client_data = clients_collection.find_one({"_id": ObjectId(client_id)})
+async def fetch_audience(client_id: str, background_tasks: BackgroundTasks):
+    task_id = str(uuid4())
+    tasks[task_id] = {
+        "status": "pending",
+        "client_id": client_id,
+        "start_time": datetime.utcnow(),
+    }
+    background_tasks.add_task(run_fetch_audience_task, task_id, client_id)
+    return {"task_id": task_id, "message": "Audience fetch started in background."}
+
+
+# -----------------------------
+# 7. Task Status Checker
+# -----------------------------
+@app.get("/task-status/{task_id}")
+def get_task_status(task_id: str):
+    task_info = tasks.get(task_id)
+    if not task_info:
+        return {"task_id": task_id, "status": "not found or completed (cleaned up)"}
+    return {"task_id": task_id, "status": task_info["status"], "details": task_info}
+
+
+# -----------------------------
+# Background task to generate message and update DB
+# -----------------------------
+def convert_objectid_to_str(data):
+    """Recursively convert ObjectId fields to strings in dictionaries and lists."""
+    if isinstance(data, dict):
+        return {key: convert_objectid_to_str(value) for key, value in data.items() if key != '_id'}
+    elif isinstance(data, list):
+        return [convert_objectid_to_str(item) for item in data]
+    elif isinstance(data, ObjectId):
+        return str(data)
+    elif isinstance(data, datetime):
+        return data.isoformat()
+    else:
+        return data
+
+def convert_datetime_to_str(obj):
+    """Recursively convert datetime objects to ISO format strings."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {key: convert_datetime_to_str(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_datetime_to_str(item) for item in obj]
+    elif isinstance(obj, ObjectId):
+        return str(obj)
+    else:
+        return obj
+
+
+def serialize_crew_output(crew_output):
+    """
+    Convert CrewOutput object to a JSON-serializable dictionary.
+    Handles nested objects like TaskOutput and UsageMetrics.
+    """
+    try:
+        result = {
+            "raw_message": crew_output.raw if hasattr(crew_output, 'raw') else str(crew_output),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+        
+        # Extract token usage if available
+        if hasattr(crew_output, 'token_usage') and crew_output.token_usage:
+            result["token_usage"] = {
+                "total_tokens": crew_output.token_usage.total_tokens,
+                "prompt_tokens": crew_output.token_usage.prompt_tokens,
+                "completion_tokens": crew_output.token_usage.completion_tokens,
+                "successful_requests": crew_output.token_usage.successful_requests
+            }
+        
+        # Extract task outputs if available
+        if hasattr(crew_output, 'tasks_output') and crew_output.tasks_output:
+            result["tasks_output"] = []
+            for task in crew_output.tasks_output:
+                task_data = {
+                    "agent": task.agent if hasattr(task, 'agent') else "Unknown",
+                    "summary": task.summary if hasattr(task, 'summary') else "",
+                    "raw": task.raw if hasattr(task, 'raw') else ""
+                }
+                result["tasks_output"].append(task_data)
+        
+        return result
+    except Exception as e:
+        print(f"⚠️ Error serializing CrewOutput: {e}")
+        # Fallback: return just the string representation
+        return {
+            "raw_message": str(crew_output),
+            "generated_at": datetime.utcnow().isoformat(),
+            "error": f"Partial serialization: {str(e)}"
+        }
+
+
+def convert_datetime_to_str(obj):
+    """Recursively convert datetime objects to ISO format strings."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {key: convert_datetime_to_str(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_datetime_to_str(item) for item in obj]
+    elif isinstance(obj, ObjectId):
+        return str(obj)
+    else:
+        return obj
+
+
+async def generate_message_task_async(client_id: str, task_id: str):
+    """Generate message for client asynchronously using ThreadPoolExecutor."""
+    tasks[task_id] = {
+        "status": "running", 
+        "client_id": client_id, 
+        "start_time": datetime.utcnow()
+    }
+    
+    try:
+        # ✅ Exclude _id field to avoid ObjectId serialization issues
+        client_data = clients_collection.find_one(
+            {"client_id": client_id},
+            {"_id": 0}  # Exclude MongoDB's _id field
+        )
+        
+        if not client_data:
+            tasks[task_id]["status"] = "failed: client not found"
+            print(f"❌ Client {client_id} not found in database")
+            return
+
+        # ✅ Convert all datetime objects to strings before processing
+        client_data = convert_datetime_to_str(client_data)
+
+        print(f"🎯 Generating message for client {client_id} - {client_data.get('platform')}")
+        
+        # Run kickoff_message_generation in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as pool:
+            generated_message = await loop.run_in_executor(
+                pool, 
+                kickoff_message_generation, 
+                client_data
+            )
+
+        print(f"✅ Message generation completed for client {client_id}")
+        
+        # ✅ CRITICAL: Serialize the CrewOutput object before saving to MongoDB
+        serialized_message = serialize_crew_output(generated_message)
+        
+        print(f"📝 Serialized message data: {serialized_message.get('raw_message', '')[:100]}...")
+        
+        # Update MongoDB with serializable data
+        update_result = clients_collection.update_one(
+            {"client_id": client_id},
+            {
+                "$set": {
+                    "generated_messages": serialized_message,
+                    "messages_generated_at": datetime.utcnow(),
+                    "current_status": "message_generated"
+                }
+            }
+        )
+        
+        if update_result.modified_count > 0:
+            print(f"✅ Message saved to database for client {client_id}")
+        else:
+            print(f"⚠️ Database update returned 0 modified documents for client {client_id}")
+
+        # Update task status
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["result"] = serialized_message
+        
+    except Exception as e:
+        error_msg = str(e)
+        tasks[task_id]["status"] = f"failed: {error_msg}"
+        tasks[task_id]["result"] = {"error": error_msg}
+        print(f"❌ Error generating message for client {client_id}: {error_msg}")
+        
+        # Try to update the client status to reflect the error
+        try:
+            clients_collection.update_one(
+                {"client_id": client_id},
+                {
+                    "$set": {
+                        "current_status": "message_generation_failed",
+                        "last_error": error_msg,
+                        "error_at": datetime.utcnow()
+                    }
+                }
+            )
+        except Exception as db_error:
+            print(f"❌ Failed to update error status in database: {db_error}")
+            
+# -----------------------------
+# Endpoint to trigger async message generation
+# -----------------------------
+@app.post("/generate-messages/{client_id}")
+async def generate_messages(client_id: str, background_tasks: BackgroundTasks):
+    client_data = clients_collection.find_one({"client_id": client_id})
     if not client_data:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    platform = client_data["platform"]
-    results = run_apify(platform, client_data["search_terms_with_location"], client_data.get("preferred_profession"), client_data.get("preferred_location"))
+    task_id = str(uuid4())
+    tasks[task_id] = {"status": "pending", "client_id": client_id, "start_time": datetime.utcnow()}
 
-    stored_count = 0
-    for i, r in enumerate(results):
-        if not r:
-            continue
-        r["client_id"] = str(client_data["_id"])
-        r["platform"] = platform
-        r["fetched_at"] = datetime.utcnow()
-        unique_key = r.get("profileUrl") or r.get("publicIdentifier") or r.get("unique_key") or f"{platform}_{i}_{datetime.utcnow().timestamp()}"
-        r["unique_key"] = unique_key
-        if not audience_collection.find_one({"client_id": str(client_data["_id"]), "platform": platform, "unique_key": unique_key}):
-            audience_collection.insert_one(r)
-            stored_count += 1
+    # Add async-safe background task
+    background_tasks.add_task(generate_message_task_async, client_id, task_id)
 
-    status = "data_fetched" if stored_count else "data_fetch_attempted"
-    clients_collection.update_one({"_id": client_data["_id"]}, {"$set": {"status": status, "data_fetched_at": datetime.utcnow(), "last_fetch_count": stored_count}})
-    return {"message": f"Fetched {stored_count} {platform.upper()} items.", "stored_count": stored_count}
+    return {
+        "client_id": client_id,
+        "task_id": task_id,
+        "message": "Message generation started in background. Check /task-status/<task_id> or /client/<client_id>/message"
+    }
 
 
-def fetch_and_store_audience_data():
-    """Background job for Instagram, Facebook, and LinkedIn with LinkedIn defaults."""
-    clients = clients_collection.find({})
-    
-    for client_data in clients:
-        try:
-            platform = client_data["platform"].lower()
-            print(f"🔄 Background job processing: {client_data['name']} - Platform: {platform.upper()}")
+# -----------------------------
+# Endpoint to fetch generated message
+# -----------------------------
+@app.get("/client/{client_id}/message")
+async def get_generated_message(client_id: str):
+    client_data = clients_collection.find_one({"client_id": client_id})
+    if not client_data:
+        raise HTTPException(status_code=404, detail="Client not found")
 
-            # ---------------- Run Apify ----------------
-            results = run_apify(
-                platform,
-                client_data.get("search_terms_with_location", []),
-                client_data.get("preferred_profession"),
-                client_data.get("preferred_location")
-            )
-
-            if not results:
-                print(f"⚠️ No results found for {client_data['name']} on {platform.upper()}")
-                continue
-
-            stored_count = 0
-            for i, r in enumerate(results):
-                if not r:
-                    continue
-
-                r["client_id"] = str(client_data["_id"])
-                r["platform"] = platform
-                r["fetched_at"] = datetime.utcnow()
-
-                # ---------------- Unique Key ----------------
-                if platform == "linkedin":
-                    unique_key = r.get("profileUrl") or r.get("publicIdentifier") or f"li_{i}_{datetime.utcnow().timestamp()}"
-                elif platform == "instagram":
-                    unique_key = r.get("id") or r.get("shortCode") or r.get("url") or f"ig_{i}_{datetime.utcnow().timestamp()}"
-                elif platform == "facebook":
-                    unique_key = r.get("unique_key") or f"fb_{i}_{datetime.utcnow().timestamp()}"
-                else:
-                    unique_key = f"{platform}_{i}_{datetime.utcnow().timestamp()}"
-
-                r["unique_key"] = unique_key
-
-                # ---------------- Avoid Duplicates ----------------
-                existing_record = audience_collection.find_one({
-                    "client_id": str(client_data["_id"]),
-                    "platform": platform,
-                    "unique_key": unique_key
-                })
-
-                if not existing_record:
-                    audience_collection.insert_one(r)
-                    stored_count += 1
-
-            print(f"✅ Background job stored {stored_count} new {platform.upper()} results for {client_data['name']}")
-
-        except Exception as e:
-            print(f"❌ Background job error for {client_data.get('name', 'unknown')}: {e}")
-            continue
-
-# Schedule the job every 6 hours
-scheduler.add_job(fetch_and_store_audience_data, "interval", hours=6)
-
-@app.post("/generate-messages/{client_id}")
-def generate_messages(client_id: str):
-    """Enhanced message generation for multiple platforms."""
-    try:
-        client_data = clients_collection.find_one({"_id": ObjectId(client_id)})
-        if not client_data:
-            raise HTTPException(status_code=404, detail="Client not found")
-            
-        # Accept both "data_fetched" and "data_fetch_attempted" statuses
-        valid_statuses = ["data_fetched", "data_fetch_attempted"]
-        if client_data.get("status") not in valid_statuses:
-            raise HTTPException(
-                status_code=400, 
-                detail="Audience data not fetched yet. Please run /fetch-audience first."
-            )
-
-        platform = client_data["platform"].lower()
-
-        # Check if we have any data for this client and platform
-        audience_count = audience_collection.count_documents({
-            "client_id": client_id, 
-            "platform": platform
-        })
-        
-        if audience_count == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No {platform.upper()} audience data found. Please fetch audience data first."
-            )
-
-        # Convert ObjectId to string before sending to crew
-        client_data = convert_objectids(client_data)
-        
-        print(f"🚀 Starting {platform.upper()} message generation for client: {client_data['name']}")
-        print(f"📊 Found {audience_count} {platform.upper()} profiles to analyze")
-        
-        crew_result = kickoff_message_generation(client_data)
-
-        # Extract final message from crew result
-        final_message = None
-        if isinstance(crew_result, dict):
-            final_message = crew_result.get("final_output") or crew_result.get("output")
-        elif hasattr(crew_result, "output"):
-            final_message = crew_result.output
-        else:
-            final_message = str(crew_result)
-
-        # Update client with generated message
-        clients_collection.update_one(
-            {"_id": ObjectId(client_id)}, 
-            {"$set": {
-                "status": "messages_generated", 
-                "messages_generated_at": datetime.utcnow(),
-                "generated_messages": final_message,
-                f"{platform}_message_generated": True
-            }}
-        )
-
+    if client_data.get("generated_messages"):
         return {
             "client_id": client_id,
-            "platform": platform.upper(),
-            "final_message": final_message,
-            "audience_profiles_analyzed": audience_count,
-            "status": "✅ Personalized message generated successfully!"
+            "generated_message": client_data["generated_messages"],
+            "messages_generated_at": client_data.get("messages_generated_at"),
+            "current_status": client_data.get("current_status"),
         }
-        
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"❌ Error in generate_messages: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    else:
+        return {
+            "client_id": client_id,
+            "message": "Message not generated yet. Please try again in a few seconds.",
+            "current_status": client_data.get("current_status"),
+        }
+
+
 
 @app.get("/audience/{client_id}")
 def get_audience_data(client_id: str):
-    """Enhanced audience data viewer with platform filtering."""
+    """View stored audience data with platform filtering (UUID-safe)."""
     try:
-        client_data = clients_collection.find_one({"_id": ObjectId(client_id)})
+        # ✅ Use client_id string instead of ObjectId
+        client_data = clients_collection.find_one({"client_id": client_id})
         if not client_data:
             raise HTTPException(status_code=404, detail="Client not found")
 
@@ -327,18 +474,18 @@ def get_audience_data(client_id: str):
         # Fetch platform-specific audience data
         audience_data = list(
             audience_collection.find(
-                {"client_id": client_id, "platform": platform}, 
+                {"client_id": client_id, "platform": platform},
                 {"_id": 0}
             )
-            .sort("fetched_at", -1)   # newest first
+            .sort("fetched_at", -1)  # newest first
             .limit(10)
         )
 
         total_count = audience_collection.count_documents({
-            "client_id": client_id, 
+            "client_id": client_id,
             "platform": platform
         })
-        
+
         return {
             "client_id": client_id,
             "client_name": client_data.get("name"),
@@ -348,22 +495,23 @@ def get_audience_data(client_id: str):
             "status": client_data.get("status", "unknown"),
             "last_fetch_count": client_data.get("last_fetch_count", 0)
         }
-        
+
     except Exception as e:
         print(f"❌ Error in get_audience_data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/client/{client_id}/status")
 def get_client_status(client_id: str):
-    """Get detailed client status and progress."""
+    """Get detailed client status and progress (UUID-safe)."""
     try:
-        client_data = clients_collection.find_one({"_id": ObjectId(client_id)})
+        client_data = clients_collection.find_one({"client_id": client_id})
         if not client_data:
             raise HTTPException(status_code=404, detail="Client not found")
 
         platform = client_data["platform"].lower()
         audience_count = audience_collection.count_documents({
-            "client_id": client_id, 
+            "client_id": client_id,
             "platform": platform
         })
 
@@ -387,7 +535,7 @@ def get_client_status(client_id: str):
             status_info["latest_generated_message"] = client_data.get("generated_messages")
 
         return status_info
-        
+
     except Exception as e:
         print(f"❌ Error in get_client_status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -406,12 +554,13 @@ def root():
             "✅ Enhanced logging and debugging"
         ],
         "endpoints": {
-            "POST /register": "Register a new client with platform, profession, location, and search terms",
-            "POST /fetch-audience/{client_id}": "Run Apify and store platform-specific audience data",
-            "POST /generate-messages/{client_id}": "Generate personalized outreach messages",
-            "GET /audience/{client_id}": "View stored audience data with platform stats",
-            "GET /client/{client_id}/status": "Get detailed client status and progress",
-            "GET /test-platform/{platform}": "Test individual platform scraping"
+        "POST /register": "Register a new client with platform, profession, location, and search terms (returns client_id as UUID)",
+        "POST /fetch-audience/{client_id}": "Run Apify and store platform-specific audience data (client_id is UUID)",
+        "POST /generate-messages/{client_id}": "Generate personalized outreach messages (client_id is UUID)",
+        "GET /audience/{client_id}": "View stored audience data with platform stats (client_id is UUID)",
+        "GET /client/{client_id}/status": "Get detailed client status and progress (client_id is UUID)",
+        "GET /task-status/{task_id}": "Check background task status (task_id is UUID)"
+    
         },
         "status": "✅ Ready to process multi-platform outreach requests with improved reliability"
     }
