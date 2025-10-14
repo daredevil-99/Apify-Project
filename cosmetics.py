@@ -66,42 +66,114 @@ def clean_hashtag(tag):
     cleaned = re.sub(r'[^a-zA-Z0-9_]', '', tag.replace(' ', ''))
     return cleaned.lower()
 
+import re
+
+def calculate_location_relevance(profile, preferred_location):
+    """
+    Calculate how relevant a profile is to the preferred location.
+    Returns a score from 0-10.
+    """
+    if not preferred_location:
+        return 5  # neutral score if no location preference
+    
+    location_lower = preferred_location.lower()
+    score = 0
+    
+    # Check bio for location mentions
+    bio = profile.get('bio', '').lower()
+    if location_lower in bio:
+        score += 5
+    
+    # Check username for location
+    username = profile.get('username', '').lower()
+    if location_lower in username:
+        score += 3
+    
+    # Check hashtags for location
+    hashtags = profile.get('hashtags', [])
+    for tag in hashtags:
+        if location_lower in tag.lower():
+            score += 2
+            break
+    
+    # Check recent posts captions
+    recent_posts = profile.get('recent_posts', [])
+    for post in recent_posts[:3]:  # Check first 3 posts
+        caption = post.get('caption', '').lower()
+        if location_lower in caption:
+            score += 1
+            break
+    
+    return min(score, 10)  # Cap at 10
+
+
+def filter_profiles_by_location(profiles, preferred_location, min_score=3):
+    """
+    Filter profiles based on location relevance.
+    Returns sorted list with most relevant profiles first.
+    """
+    if not preferred_location:
+        return profiles
+    
+    # Add location relevance score to each profile
+    scored_profiles = []
+    for profile in profiles:
+        location_score = calculate_location_relevance(profile, preferred_location)
+        profile['location_relevance_score'] = location_score
+        if location_score >= min_score:
+            scored_profiles.append(profile)
+    
+    # Sort by location relevance (highest first)
+    scored_profiles.sort(key=lambda x: x.get('location_relevance_score', 0), reverse=True)
+    
+    return scored_profiles
+
+
 def run_apify(platform, search_terms, profession=None, preferred_location=None):
-    """Run Apify actors for Instagram, LinkedIn, and Facebook."""
+    """Run Apify actors for Instagram, LinkedIn, and Facebook with improved location filtering."""
     try:
         # ---------------- Facebook ----------------
         if platform == "facebook":
             actor_id = "apify/facebook-search-scraper"
             payload = {
-                    "categories": search_terms,
-                    "locations": [preferred_location],
-                    "resultsLimit": 20,
-                    "maxRequestRetries": 5,
-                    "proxy": {"apifyProxyGroups": ["RESIDENTIAL"]}
-                }
-
+                "categories": search_terms,
+                "locations": [preferred_location] if preferred_location else [],
+                "resultsLimit": 20,
+                "maxRequestRetries": 5,
+                "proxy": {"apifyProxyGroups": ["RESIDENTIAL"]}
+            }
 
         # ---------------- Instagram ----------------
         elif platform == "instagram":
-            # Build dynamic hashtags
+            # Build dynamic hashtags with location
             hashtags = [clean_hashtag(t) for t in search_terms if clean_hashtag(t)]
 
             if profession:
                 hashtags.append(clean_hashtag(profession))
+            
+            # ✅ ADD LOCATION-SPECIFIC HASHTAGS
             if preferred_location:
-                hashtags.append(clean_hashtag(preferred_location))
+                # Add multiple location variations
+                location_clean = clean_hashtag(preferred_location)
+                location_hashtags = [
+                    location_clean,
+                    f"{location_clean}{clean_hashtag(profession)}" if profession else None,
+                    f"{clean_hashtag(profession)}{location_clean}" if profession else None,
+                ]
+                # Filter out None values
+                hashtags.extend([h for h in location_hashtags if h])
 
-            # Remove duplicates and empty strings
+            # Remove duplicates and empty strings, limit to 10
             hashtags = list({t for t in hashtags if t})[:10]
 
             actor_id = "apify/instagram-hashtag-scraper"
             payload = {
                 "hashtags": hashtags,
-                "resultsLimit": 20,
+                "resultsLimit": 50,  # ✅ Increased to get more results for filtering
                 "addParentData": False
             }
 
-            print(f"📸 Using dynamic Instagram hashtags: {hashtags}")
+            print(f"📸 Using location-enhanced Instagram hashtags: {hashtags}")
 
         # ---------------- LinkedIn ----------------
         elif platform == "linkedin":
@@ -110,7 +182,7 @@ def run_apify(platform, search_terms, profession=None, preferred_location=None):
                 "searchQuery": " OR ".join(search_terms[:5]),
                 "profileScraperMode": "Full",
                 "startPage": 1,
-                "maxItems": 0,  # scrape all available profiles
+                "maxItems": 0,
                 "locations": [preferred_location] if preferred_location else []
             }
 
@@ -129,11 +201,84 @@ def run_apify(platform, search_terms, profession=None, preferred_location=None):
         dataset_client = apify_client.dataset(run["defaultDatasetId"])
         items = list(dataset_client.iterate_items())
         print(f"✅ Retrieved {len(items)} {platform.upper()} results")
+        
+        # ✅ APPLY LOCATION FILTERING FOR INSTAGRAM
+        if platform == "instagram" and preferred_location:
+            filtered_items = filter_profiles_by_location(items, preferred_location, min_score=2)
+            print(f"🎯 Filtered to {len(filtered_items)} location-relevant profiles (from {len(items)} total)")
+            return filtered_items[:20]  # Return top 20 most relevant
+        
         return items
 
     except Exception as e:
         print(f"❌ Error running {platform.upper()} Apify actor: {e}")
         return []
+
+
+# ✅ UPDATE THE AUDIENCE STORAGE TO INCLUDE LOCATION SCORE
+def run_fetch_audience_task(task_id: str, client_id: str):
+    try:
+        tasks[task_id]["status"] = "running"
+        client_data = clients_collection.find_one({"client_id": client_id})
+        if not client_data:
+            raise Exception("Client not found")
+
+        platform = client_data["platform"]
+        results = run_apify(
+            platform,
+            client_data["search_terms_with_location"],
+            client_data.get("preferred_profession"),
+            client_data.get("preferred_location"),
+        )
+
+        stored_count = 0
+        for i, r in enumerate(results):
+            if not r:
+                continue
+            r["client_id"] = client_id
+            r["platform"] = platform
+            r["fetched_at"] = datetime.utcnow()
+            
+            # ✅ Keep location relevance score if it exists
+            if 'location_relevance_score' not in r:
+                r['location_relevance_score'] = 0
+            
+            unique_key = (
+                r.get("profileUrl")
+                or r.get("publicIdentifier")
+                or r.get("unique_key")
+                or f"{platform}_{i}_{datetime.utcnow().timestamp()}"
+            )
+            r["unique_key"] = unique_key
+            
+            if not audience_collection.find_one(
+                {"client_id": client_id, "platform": platform, "unique_key": unique_key}
+            ):
+                audience_collection.insert_one(r)
+                stored_count += 1
+
+        status = "data_fetched" if stored_count else "data_fetch_attempted"
+        clients_collection.update_one(
+            {"client_id": client_id},
+            {
+                "$set": {
+                    "status": status,
+                    "data_fetched_at": datetime.utcnow(),
+                    "last_fetch_count": stored_count,
+                }
+            },
+        )
+
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["result"] = {"stored_count": stored_count, "platform": platform}
+
+    except Exception as e:
+        tasks[task_id]["status"] = f"failed: {str(e)}"
+
+    finally:
+        print(f"🧹 Cleaning up task {task_id}")
+        time.sleep(2)
+        del tasks[task_id]
 
 # -----------------------------
 # 4. Register Client with UUID
@@ -412,7 +557,7 @@ async def generate_message_task_async(client_id: str, task_id: str):
             )
         except Exception as db_error:
             print(f"❌ Failed to update error status in database: {db_error}")
-            
+
 # -----------------------------
 # Endpoint to trigger async message generation
 # -----------------------------
@@ -462,22 +607,26 @@ async def get_generated_message(client_id: str):
 
 @app.get("/audience/{client_id}")
 def get_audience_data(client_id: str):
-    """View stored audience data with platform filtering (UUID-safe)."""
+    """View stored audience data with platform filtering and location relevance (UUID-safe)."""
     try:
-        # ✅ Use client_id string instead of ObjectId
+        # Use client_id string instead of ObjectId
         client_data = clients_collection.find_one({"client_id": client_id})
         if not client_data:
             raise HTTPException(status_code=404, detail="Client not found")
 
         platform = client_data["platform"].lower()
+        preferred_location = client_data.get("preferred_location", "Not specified")
 
-        # Fetch platform-specific audience data
+        # Fetch platform-specific audience data, sorted by location relevance
         audience_data = list(
             audience_collection.find(
                 {"client_id": client_id, "platform": platform},
                 {"_id": 0}
             )
-            .sort("fetched_at", -1)  # newest first
+            .sort([
+                ("location_relevance_score", -1),  # Best matches first
+                ("fetched_at", -1)
+            ])
             .limit(10)
         )
 
@@ -486,11 +635,28 @@ def get_audience_data(client_id: str):
             "platform": platform
         })
 
+        # Calculate location match statistics
+        location_matches = sum(
+            1 for profile in audience_data 
+            if profile.get('location_relevance_score', 0) >= 5
+        )
+        
+        weak_matches = sum(
+            1 for profile in audience_data 
+            if 2 <= profile.get('location_relevance_score', 0) < 5
+        )
+
         return {
             "client_id": client_id,
             "client_name": client_data.get("name"),
             "platform": platform.upper(),
+            "preferred_location": preferred_location,
             "total_profiles": total_count,
+            "location_statistics": {
+                "strong_matches": location_matches,
+                "weak_matches": weak_matches,
+                "no_location_data": len(audience_data) - location_matches - weak_matches
+            },
             "sample_profiles": audience_data,
             "status": client_data.get("status", "unknown"),
             "last_fetch_count": client_data.get("last_fetch_count", 0)
@@ -500,6 +666,49 @@ def get_audience_data(client_id: str):
         print(f"❌ Error in get_audience_data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/audience/{client_id}/best-matches")
+def get_best_location_matches(client_id: str, min_score: int = 5):
+    """
+    Get only the best location-matched profiles.
+    
+    Query params:
+        min_score: Minimum location relevance score (default: 5)
+    """
+    try:
+        client_data = clients_collection.find_one({"client_id": client_id})
+        if not client_data:
+            raise HTTPException(status_code=404, detail="Client not found")
+
+        platform = client_data["platform"].lower()
+        preferred_location = client_data.get("preferred_location")
+
+        # Fetch only high-scoring profiles
+        best_matches = list(
+            audience_collection.find(
+                {
+                    "client_id": client_id,
+                    "platform": platform,
+                    "location_relevance_score": {"$gte": min_score}
+                },
+                {"_id": 0}
+            )
+            .sort("location_relevance_score", -1)
+            .limit(10)
+        )
+
+        return {
+            "client_id": client_id,
+            "platform": platform.upper(),
+            "preferred_location": preferred_location,
+            "min_score_threshold": min_score,
+            "matches_found": len(best_matches),
+            "profiles": best_matches
+        }
+
+    except Exception as e:
+        print(f"❌ Error in get_best_location_matches: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/client/{client_id}/status")
 def get_client_status(client_id: str):

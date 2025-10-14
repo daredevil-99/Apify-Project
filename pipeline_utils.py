@@ -53,71 +53,252 @@ class FetchFromMongoTool(BaseTool):
         return cleaned
     
     def _run(self, client_id: str = None, platform: str = None, search_terms: List[str] = None, limit: int = 1):
-        try:
-            # Build query with strict platform filtering
-            query = {}
-            if client_id:
-                query["client_id"] = client_id
-            if platform:
-                query["platform"] = platform.lower()
+            try:
+                # Build query with strict platform filtering
+                query = {}
+                if client_id:
+                    query["client_id"] = client_id
+                if platform:
+                    query["platform"] = platform.lower()
 
-            print(f"🔍 MongoDB Query: {query}")
-            print(f"🔍 Search Terms: {search_terms}")
-            print(f"🔍 Platform Filter: {platform}")
-            
-            # Fetch all matching results
-            all_results = list(audience_collection.find(query, {"_id": 0}))
-            print(f"📊 Found {len(all_results)} total profiles for {platform.upper()}")
-            
-            if not all_results:
-                print(f"❌ No data found for platform: {platform}")
-                return {"error": f"No {platform} data found", "platform": platform}
+                print(f"🔍 MongoDB Query: {query}")
+                print(f"🔍 Search Terms: {search_terms}")
+                print(f"🔍 Platform Filter: {platform}")
+                
+                # ✅ UPDATED: Sort by location relevance first, then fetch
+                sort_criteria = [
+                    ("location_relevance_score", -1),  # Highest location score first
+                    ("fetched_at", -1)  # Most recent if scores are equal
+                ]
+                
+                # Fetch all matching results with sorting
+                all_results = list(
+                    audience_collection.find(query, {"_id": 0})
+                    .sort(sort_criteria)
+                    .limit(50)  # Get more results to filter from
+                )
+                
+                print(f"📊 Found {len(all_results)} total profiles for {platform.upper()}")
+                
+                # ✅ Log location scores for debugging
+                if all_results:
+                    top_scores = [r.get('location_relevance_score', 0) for r in all_results[:5]]
+                    print(f"📍 Top 5 location scores: {top_scores}")
+                
+                if not all_results:
+                    print(f"❌ No data found for platform: {platform}")
+                    return {"error": f"No {platform} data found", "platform": platform}
 
-            # Validate data quality before processing
-            valid_results = self._validate_platform_data(all_results, platform)
-            
-            if not valid_results:
-                print(f"❌ No valid {platform} data found after validation")
-                return {"error": f"No valid {platform} content found", "platform": platform, "raw_data": all_results[:1]}
+                # Validate data quality before processing
+                valid_results = self._validate_platform_data(all_results, platform)
+                
+                if not valid_results:
+                    print(f"❌ No valid {platform} data found after validation")
+                    return {"error": f"No valid {platform} content found", "platform": platform, "raw_data": all_results[:1]}
 
-            # Score and rank profiles based on search terms relevance
-            if search_terms:
-                scored_profiles = self._score_profiles_by_relevance(valid_results, search_terms, platform)
-            else:
-                scored_profiles = valid_results
-
-            # Get top profile(s)
-            top_profiles = scored_profiles[:limit]
-            
-            # Process and standardize the data based on platform
-            processed_profiles = []
-            for profile in top_profiles:
-                if platform == "instagram":
-                    processed_profile = self._standardize_instagram_profile(profile)
-                elif platform == "linkedin":
-                    processed_profile = self._standardize_linkedin_profile(profile)
-                elif platform == "facebook":
-                    processed_profile = self._standardize_facebook_profile(profile)
+                # Score and rank profiles based on search terms relevance
+                if search_terms:
+                    scored_profiles = self._score_profiles_by_relevance(valid_results, search_terms, platform)
                 else:
-                    processed_profile = self._standardize_generic_profile(profile)
-                    
-                if processed_profile and processed_profile.get("has_valid_content", False):
-                    processed_profiles.append(processed_profile)
-            
-            if not processed_profiles:
-                print(f"❌ No valid processed profiles for {platform}")
-                return {
-                    "error": f"No valid {platform} profiles after processing", 
-                    "platform": platform,
-                    "raw_data_sample": all_results[:1]
-                }
-            
-            print(f"✅ Processed {len(processed_profiles)} valid {platform} profiles")
-            return processed_profiles[0] if processed_profiles else {"error": "No valid profiles"}
+                    scored_profiles = valid_results
 
-        except Exception as e:
-            print(f"❌ Error in FetchFromMongoTool: {e}")
-            return {"error": str(e), "platform": platform or "unknown"}
+                # Get top profile(s)
+                top_profiles = scored_profiles[:limit]
+                
+                # Process and standardize the data based on platform
+                processed_profiles = []
+                for profile in top_profiles:
+                    if platform == "instagram":
+                        processed_profile = self._standardize_instagram_profile(profile)
+                    elif platform == "linkedin":
+                        processed_profile = self._standardize_linkedin_profile(profile)
+                    elif platform == "facebook":
+                        processed_profile = self._standardize_facebook_profile(profile)
+                    else:
+                        processed_profile = self._standardize_generic_profile(profile)
+                        
+                    if processed_profile and processed_profile.get("has_valid_content", False):
+                        processed_profiles.append(processed_profile)
+                
+                if not processed_profiles:
+                    print(f"❌ No valid processed profiles for {platform}")
+                    return {
+                        "error": f"No valid {platform} profiles after processing", 
+                        "platform": platform,
+                        "raw_data_sample": all_results[:1]
+                    }
+                
+                # ✅ Log the selected profile's location score
+                selected_profile = processed_profiles[0]
+                location_score = selected_profile.get('location_relevance_score', 0)
+                print(f"✅ Selected profile with location score: {location_score}")
+                print(f"✅ Processed {len(processed_profiles)} valid {platform} profiles")
+                
+                return selected_profile
+
+            except Exception as e:
+                print(f"❌ Error in FetchFromMongoTool: {e}")
+                return {"error": str(e), "platform": platform or "unknown"}
+
+
+        # ✅ ADD THIS NEW METHOD to _score_profiles_by_relevance (around line 180)
+        # Update the existing method to include location score weighting
+
+    def _score_profiles_by_relevance(self, profiles: List[Dict], search_terms: List[str], platform: str) -> List[Dict]:
+            """Score profiles based on search terms relevance AND location for different platforms"""
+            if not search_terms:
+                return profiles
+
+            scored_profiles = []
+            search_terms_lower = [term.lower() for term in search_terms]
+
+            for profile in profiles:
+                score = 0
+                
+                # ✅ ADD LOCATION SCORE BONUS (weighted heavily)
+                location_score = profile.get('location_relevance_score', 0)
+                score += location_score * 2  # Double weight for location relevance
+
+                if platform == "facebook":
+                    categories = [c.lower() for c in profile.get("categories", [])]
+                    info_text = " ".join(profile.get("info", [])).lower()
+                    title = profile.get("title", "").lower()
+                    about_me = profile.get("about_me", {}).get("text", "").lower()
+
+                    for term in search_terms_lower:
+                        if any(term in c for c in categories):
+                            score += 4
+                        if term in info_text:
+                            score += 3
+                        if term in title:
+                            score += 2
+                        if term in about_me:
+                            score += 3
+
+                    # Bonus scoring
+                    score += int(profile.get("likes", 0) / 100)
+                    score += int(profile.get("followers", 0) / 100)
+                    if profile.get("ratingOverall"):
+                        score += int(profile["ratingOverall"])
+                                            
+                elif platform == "instagram":
+                    # Instagram specific scoring
+                    caption = profile.get("caption", "").lower()
+                    hashtags = [tag.lower() for tag in profile.get("hashtags", [])]
+                    
+                    # Score based on hashtag matches (higher weight)
+                    for hashtag in hashtags:
+                        for term in search_terms_lower:
+                            if term in hashtag or hashtag in term:
+                                score += 3
+                    
+                    # Score based on caption content matches
+                    for term in search_terms_lower:
+                        if term in caption:
+                            score += 2
+                    
+                    # Bonus for engagement metrics
+                    likes_count = profile.get("likesCount", 0)
+                    comments_count = profile.get("commentsCount", 0)
+                    if likes_count > 10:
+                        score += 1
+                    if comments_count > 2:
+                        score += 1
+                        
+                elif platform == "linkedin":
+                    # LinkedIn specific scoring
+                    headline = profile.get("headline", "").lower()
+                    summary = profile.get("summary", "").lower()
+                    industry = profile.get("industry", "").lower()
+                    experience = profile.get("experience", [])
+                    
+                    # Score based on headline matches (high weight)
+                    for term in search_terms_lower:
+                        if term in headline:
+                            score += 4
+                        if term in summary:
+                            score += 3
+                        if term in industry:
+                            score += 2
+                    
+                    # Score based on experience
+                    for exp in experience[:3]:
+                        exp_text = str(exp).lower()
+                        for term in search_terms_lower:
+                            if term in exp_text:
+                                score += 2
+                    
+                    # Bonus for connections
+                    connections = profile.get("connectionsCount", 0)
+                    if connections > 500:
+                        score += 1
+                        
+                scored_profiles.append({**profile, "relevance_score": score})
+            
+            # Sort by combined relevance score (descending)
+            scored_profiles.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+            
+            if scored_profiles:
+                top_profile = scored_profiles[0]
+                print(f"🎯 Top {platform} profile - Total score: {top_profile.get('relevance_score', 0)}, "
+                    f"Location score: {top_profile.get('location_relevance_score', 0)}")
+            
+            return scored_profiles
+
+
+        # ✅ UPDATE _standardize_instagram_profile to preserve location score (around line 350)
+
+    def _standardize_instagram_profile(self, raw_profile: Dict) -> Dict:
+            """Standardize Instagram profile data with enhanced validation"""
+            try:
+                # Extract username from URL or use ownerId as fallback
+                username = self._extract_username_from_url(raw_profile.get("url", ""))
+                if username == "instagram_user":
+                    username = f"user_{raw_profile.get('ownerId', 'unknown')}"
+                
+                # Analyze caption for bio-like content
+                caption = raw_profile.get("caption", "")
+                bio_content = self._extract_bio_from_caption(caption)
+                
+                # Determine content validity
+                has_valid_content = bool(
+                    caption or 
+                    raw_profile.get("hashtags") or 
+                    raw_profile.get("ownerId")
+                )
+                
+                # Get engagement metrics
+                engagement_score = self._calculate_engagement_score(raw_profile)
+                
+                return {
+                    "username": username,
+                    "bio": bio_content,
+                    "hashtags": raw_profile.get("hashtags", [])[:10],
+                    "platform": "instagram",
+                    "has_valid_content": has_valid_content,
+                    "recent_posts": [{
+                        "caption": caption[:150] + "..." if len(caption) > 150 else caption,
+                        "likes": raw_profile.get("likesCount", 0),
+                        "comments": raw_profile.get("commentsCount", 0),
+                        "url": raw_profile.get("url", "")
+                    }],
+                    "profile_url": f"https://www.instagram.com/{username}/",
+                    "post_engagement": {
+                        "likes": raw_profile.get("likesCount", 0),
+                        "comments": raw_profile.get("commentsCount", 0),
+                        "engagement_score": engagement_score
+                    },
+                    "content_type": raw_profile.get("type", "Unknown"),
+                    "post_date": raw_profile.get("timestamp", ""),
+                    "relevance_score": raw_profile.get("relevance_score", 0),
+                    "location_relevance_score": raw_profile.get("location_relevance_score", 0),  # ✅ PRESERVE THIS
+                    "owner_id": raw_profile.get("ownerId", "")
+                }
+                    
+            except Exception as e:
+                print(f"❌ Error standardizing Instagram profile: {e}")
+                return None
+
 
     def _validate_platform_data(self, profiles: List[Dict], platform: str) -> List[Dict]:
         """Validate that profiles have meaningful content for the specified platform"""
