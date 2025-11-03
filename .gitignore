@@ -1,30 +1,62 @@
-# Ignore Python virtual environments
+# 🧩 Python virtual environments
 .venv/
 venv/
 ENV/
 env/
 
-# Ignore environment variables
+# 🔐 Environment variables & credentials
 .env
+token.json
+credentials.json
+apify_storage/
+apify.json
 
-# Ignore Python cache
+# 🧠 Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Ignore VS Code settings
+# ⚙️ IDE / Editor settings
 .vscode/
+.idea/
 
-# Ignore OS files
+# 🧱 OS files
 .DS_Store
 Thumbs.db
 
-# Ignore dataset files
+# 🧾 Logs and temp files
+*.log
+*.tmp
+*.bak
+
+# 📊 Dataset & scraped data
 dataset_*.csv
 owner_ids.csv
 facebook_profiles.csv
+linkedin_profiles.csv
+instagram_profiles.csv
 
-# Ignore scripts you don't want tracked
+# 🧪 MongoDB dump / backups
+*.bson
+*.json
+*.csv
+*.zip
+
+# 🚫 Optional scripts or local runs
 facebook_scraper.py
 main.py
+test_*.py
+playground_*.py
+debug_*.py
+
+# 📦 Build / distribution artifacts
+dist/
+build/
+*.egg-info/
+
+# 🚀 OS / tool-specific
+.sass-cache/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
