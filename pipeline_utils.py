@@ -11,8 +11,15 @@ from typing import List, Dict, Any
 from gmail_utils import send_email
 from datetime import datetime
 from fetch_tool import FetchFromMongoTool
+from dotenv import load_dotenv
+from apify_client import ApifyClient
+from db_config import audience_collection, clients_collection  # ✅ Remove apify_client from here
 
-from db_config import apify_client, audience_collection, clients_collection
+load_dotenv()
+
+# ✅ CREATE APIFY CLIENT HERE INSTEAD
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
+apify_client = ApifyClient(APIFY_API_TOKEN)
 
 def auto_send_gmail(client_id: str):
     """Automatically send generated outreach message via Gmail"""

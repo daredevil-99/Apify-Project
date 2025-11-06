@@ -1,30 +1,42 @@
-# db_config.py
-from dotenv import load_dotenv
-from apify_client import ApifyClient
-import pymongo
+# db_config.py (COMPLETE VERSION)
 import os
-from apscheduler.schedulers.background import BackgroundScheduler
+import pymongo
+from apify_client import ApifyClient
+from dotenv import load_dotenv
 
 load_dotenv()
 
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
-if not APIFY_API_TOKEN:
-    raise ValueError("Missing APIFY_API_TOKEN in .env")
-
+# MongoDB setup
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise ValueError("Missing MONGO_URI in .env")
 
-client = pymongo.MongoClient(MONGO_URI)
-db = client["cosmetics_app"]
+# Apify setup
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
+if not APIFY_API_TOKEN:
+    raise ValueError("Missing APIFY_API_TOKEN in .env")
 
-clients_collection = db["clients"]
-audience_collection = db["audience_data"]
+_client = None
+_db = None
 
+def get_database():
+    """Singleton pattern for MongoDB connection"""
+    global _client, _db
+    if _db is None:
+        _client = pymongo.MongoClient(MONGO_URI)
+        _db = _client["cosmetics_app"]
+    return _db
+
+def get_clients_collection():
+    return get_database()["clients"]
+
+def get_audience_collection():
+    return get_database()["audience_data"]
+
+# ✅ BACKWARD COMPATIBILITY
+audience_collection = get_audience_collection()
+clients_collection = get_clients_collection()
+db = get_database()
+
+# ✅ APIFY CLIENT
 apify_client = ApifyClient(APIFY_API_TOKEN)
-
-scheduler = BackgroundScheduler()
-scheduler.start()
-
-# Global in-memory task tracker
-tasks = {}

@@ -1,26 +1,44 @@
+# main.py
 from fastapi import FastAPI
-from routers import routes
+from routers.routes import router
 from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
+import os
 
-app = FastAPI(title="Cosmetics Outreach Automation")
+load_dotenv()
 
-# Include all routes
-app.include_router(routes.router)
+app = FastAPI(
+    title="Multi-Platform Outreach Engine",
+    description="Hybrid stateless API with agentic orchestration",
+    version="2.0"
+)
 
-# Optional: Start background scheduler if used for periodic tasks
+# Include routers
+app.include_router(router)
+
+# Background scheduler
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-@app.on_event("startup")
-def startup_event():
-    print("🚀 FastAPI app started successfully")
-
 @app.on_event("shutdown")
-def shutdown_event():
+def shutdown_scheduler():
     scheduler.shutdown()
-    print("🛑 FastAPI app shut down gracefully")
 
-# For local run
+@app.get("/")
+def root():
+    return {
+        "message": "🚀 Multi-Platform Personalized Outreach Engine - Hybrid Model",
+        "supported_platforms": ["Instagram", "LinkedIn", "Facebook"],
+        "architecture": "Stateless API + Agentic Controller + Internal State Management",
+        "endpoints": {
+            "POST /pipeline/register": "Register client (returns UUID)",
+            "POST /pipeline/generate/{client_id}": "Scrape → Generate → Send (auto)",
+            "GET /pipeline/client/{client_id}": "Get client status",
+            "GET /pipeline/audience/{client_id}": "View audience data",
+        },
+        "status": "✅ Ready"
+    }
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("cosmetics:app", host="127.0.0.1", port=8009, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
