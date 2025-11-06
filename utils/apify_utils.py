@@ -20,6 +20,8 @@ def clean_hashtag(tag: str) -> str:
     return cleaned.lower()
 
 
+# utils/apify_utils.py
+
 def calculate_location_relevance(profile: Dict, preferred_location: str) -> int:
     """Calculate location relevance score (0-10)"""
     if not preferred_location:
@@ -28,25 +30,44 @@ def calculate_location_relevance(profile: Dict, preferred_location: str) -> int:
     location_lower = preferred_location.lower()
     score = 0
 
-    # Check bio
-    bio = profile.get('bio', '').lower()
-    if location_lower in bio:
+    # ✅ UPDATED: Check more fields for Instagram hashtag results
+    
+    # Check caption (most likely to have location info)
+    caption = profile.get('caption', '').lower()
+    if location_lower in caption:
         score += 5
-
-    # Check username
-    username = profile.get('username', '').lower()
-    if location_lower in username:
-        score += 3
-
-    # Check hashtags
+    
+    # Check hashtags (very important for Instagram)
     hashtags = profile.get('hashtags', [])
     for tag in hashtags:
         if location_lower in tag.lower():
-            score += 2
+            score += 3
             break
+    
+    # Check alt text
+    alt = profile.get('alt', '').lower()
+    if location_lower in alt:
+        score += 2
+    
+    # Check location tag if available
+    location_name = profile.get('locationName', '').lower()
+    if location_lower in location_name:
+        score += 5
+    
+    # Check owner username (sometimes has location)
+    owner_username = profile.get('ownerUsername', '').lower()
+    if location_lower in owner_username:
+        score += 3
+
+    # ✅ If score is 0 but profile uses location-based hashtag, give minimum score
+    if score == 0:
+        for tag in hashtags:
+            # Check if any hashtag contains location-related words
+            if any(loc_word in tag.lower() for loc_word in ['chennai', 'india', 'tamil']):
+                score += 1
+                break
 
     return min(score, 10)
-
 
 def filter_profiles_by_location(profiles: List[Dict], preferred_location: str, min_score: int = 2) -> List[Dict]:
     """Filter and sort profiles by location relevance"""
@@ -63,6 +84,8 @@ def filter_profiles_by_location(profiles: List[Dict], preferred_location: str, m
     scored_profiles.sort(key=lambda x: x.get('location_relevance_score', 0), reverse=True)
     return scored_profiles
 
+
+# utils/apify_utils.py
 
 def scrape_instagram(search_terms: List[str], profession: str = None, location: str = None) -> List[Dict]:
     """Scrape Instagram profiles via Apify"""
@@ -100,17 +123,29 @@ def scrape_instagram(search_terms: List[str], profession: str = None, location: 
         items = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
         print(f"✅ Retrieved {len(items)} Instagram results")
 
-        # Apply location filtering
+        # ✅ DEBUG: Print first profile structure
+        if items:
+            print(f"🔍 Sample profile keys: {list(items[0].keys())}")
+            print(f"🔍 Sample profile: {items[0]}")
+        # ✅ FIX: Apply location filtering with LOWER threshold (or skip if no location)
         if location:
-            items = filter_profiles_by_location(items, location, min_score=2)
+            items = filter_profiles_by_location(items, location, min_score=0)  # ✅ Changed from 2 to 0
             print(f"🎯 Filtered to {len(items)} location-relevant profiles")
+            
+            # ✅ DEBUG: Show location scores
+            if items:
+                top_5_scores = [(i.get('username', 'unknown'), i.get('location_relevance_score', 0)) for i in items[:5]]
+                print(f"📊 Top 5 profiles with scores: {top_5_scores}")
+        else:
+            # If no location preference, give all profiles a neutral score
+            for item in items:
+                item['location_relevance_score'] = 5
 
         return items[:20]
 
     except Exception as e:
         print(f"❌ Instagram scraping error: {e}")
         return []
-
 
 def scrape_linkedin(search_terms: List[str], profession: str = None, location: str = None) -> List[Dict]:
     """Scrape LinkedIn profiles via Apify"""

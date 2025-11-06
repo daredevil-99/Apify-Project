@@ -136,3 +136,108 @@ def save_scraped_profiles(client_id: str, platform: str, profiles: List[Dict]) -
 
     print(f"💾 Saved {saved_count} {platform} profiles for {client_id}")
     return saved_count
+
+
+# ========================================
+# PROSPECT MANAGEMENT FUNCTIONS
+# ========================================
+
+def get_prospects_from_audience(client_id: str, platform: str) -> Optional[Dict]:
+    """
+    Get prospects for a specific client from audience collection
+    """
+    # Find the prospects document
+    prospects_doc = audience_collection.find_one(
+        {
+            "client_id": client_id,
+            "platform": platform,
+            "type": "prospects"
+        },
+        {"_id": 0}
+    )
+    
+    return prospects_doc
+
+
+def update_prospect_status(client_id: str, platform: str, username: str, 
+                          status: str, contacted_date: str = None) -> bool:
+    """
+    Update the status of a specific prospect
+    """
+    update_data = {
+        "prospects.$.status": status,
+        "prospects.$.last_contacted": contacted_date or datetime.utcnow().isoformat()
+    }
+    
+    result = audience_collection.update_one(
+        {
+            "client_id": client_id,
+            "platform": platform,
+            "type": "prospects",
+            "prospects.username": username
+        },
+        {"$set": update_data}
+    )
+    
+    return result.modified_count > 0
+
+
+def get_prospects_by_status(client_id: str, platform: str, status: str = "new") -> List[Dict]:
+    """
+    Get prospects filtered by status (new, contacted, replied, etc.)
+    """
+    prospects_doc = get_prospects_from_audience(client_id, platform)
+    
+    if not prospects_doc:
+        return []
+    
+    prospects = prospects_doc.get('prospects', [])
+    
+    # Filter by status
+    filtered = [p for p in prospects if p.get('status') == status]
+    
+    return filtered
+
+
+def get_all_prospects(client_id: str, platform: str) -> List[Dict]:
+    """
+    Get all prospects for a client regardless of status
+    """
+    prospects_doc = get_prospects_from_audience(client_id, platform)
+    
+    if not prospects_doc:
+        return []
+    
+    return prospects_doc.get('prospects', [])
+
+
+def get_prospects_statistics(client_id: str, platform: str) -> Dict:
+    """
+    Get statistics about prospects for a client
+    """
+    prospects_doc = get_prospects_from_audience(client_id, platform)
+    
+    if not prospects_doc:
+        return {
+            "total": 0,
+            "new": 0,
+            "contacted": 0,
+            "replied": 0,
+            "verified": 0,
+            "private": 0,
+            "with_email": 0
+        }
+    
+    prospects = prospects_doc.get('prospects', [])
+    
+    stats = {
+        "total": len(prospects),
+        "new": sum(1 for p in prospects if p.get('status') == 'new'),
+        "contacted": sum(1 for p in prospects if p.get('status') == 'contacted'),
+        "replied": sum(1 for p in prospects if p.get('status') == 'replied'),
+        "verified": sum(1 for p in prospects if p.get('is_verified', False)),
+        "private": sum(1 for p in prospects if p.get('is_private', False)),
+        "with_email": sum(1 for p in prospects if p.get('email'))
+    }
+    
+    return stats
