@@ -20,8 +20,6 @@ def clean_hashtag(tag: str) -> str:
     return cleaned.lower()
 
 
-# utils/apify_utils.py
-
 def calculate_location_relevance(profile: Dict, preferred_location: str) -> int:
     """Calculate location relevance score (0-10)"""
     if not preferred_location:

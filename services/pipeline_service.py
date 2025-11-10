@@ -1,15 +1,12 @@
 # services/pipeline_service.py
 from datetime import datetime
-from pipeline_utils import kickoff_message_generation, auto_send_gmail
-from instagram_dm_sender import send_instagram_dm
-from services import db_service
-from services.scraping_service import scrape_and_store
+from pipeline_utils import kickoff_message_generation
 from utils.serialization_utils import convert_objectid_to_str
 from services.db_service import (
     get_client_data, 
     get_prospects_from_audience, 
     update_client_generated_message,
-    update_prospect_status
+    get_prospects_by_status
 )
 
 
@@ -26,67 +23,38 @@ def safe_serialize(obj):
     return str(obj)
 
 
-def generate_message(client_id: str):
+def generate_messages_for_prospects(client_id: str):
     """
-    🧠 AGENTIC CONTROLLER: Main orchestrator
-    Extract prospects → Generate → Send
+    🧠 Generate personalized messages for NEW prospects
+    This function ONLY generates messages and saves them to DB
+    It does NOT send messages - that's handled by send_dm_message()
     """
     print(f"\n{'='*60}")
-    print(f"🚀 Pipeline started for client: {client_id}")
+    print(f"🤖 Message Generation started for client: {client_id}")
     print(f"{'='*60}\n")
 
     # 1️⃣ Fetch client data
-    client_data = db_service.get_client_data(client_id)
+    client_data = get_client_data(client_id)
     if not client_data:
+        print(f"❌ Client {client_id} not found")
         return {"error": f"Client {client_id} not found"}
 
     platform = client_data.get("platform", "").lower()
     print(f"📱 Platform: {platform}")
 
-    # 2️⃣ CHECK IF PROSPECTS EXIST (NEW WAY)
+    # 2️⃣ CHECK IF PROSPECTS EXIST
     prospects_data = get_prospects_from_audience(client_id, platform)
     
     if not prospects_data or not prospects_data.get('prospects'):
-        print(f"⚠️  No extracted prospects found.")
-        print(f"🔍 Checking if scraped data exists...")
-        
-        # Check if we have scraped posts
-        scraped_count = db_service.count_prospects(client_id, platform)
-        
-        if scraped_count == 0:
-            print(f"🔍 No scraped data found. Triggering scraper...")
-            
-            # INTERNAL SCRAPING (not exposed as endpoint)
-            scrape_result = scrape_and_store(
-                client_id=client_id,
-                platform=platform,
-                search_terms=client_data.get("search_terms_with_location", []),
-                profession=client_data.get("preferred_profession"),
-                location=client_data.get("preferred_location")
-            )
-
-            if scrape_result["status"] != "success":
-                return {
-                    "status": "scraping_failed",
-                    "error": scrape_result.get("message"),
-                    "platform": platform
-                }
-
-            print(f"✅ Scraping completed: {scrape_result['profiles_count']} profiles")
-        
-        print(f"❌ Prospects not extracted yet. Please run /extract-prospects first.")
+        print(f"❌ No extracted prospects found.")
         return {
             "status": "no_prospects_extracted",
-            "message": "Scraped data exists but prospects not extracted. Run /extract-prospects endpoint first.",
-            "scraped_posts": scraped_count
+            "message": "No prospects found. Run /extract-prospects first."
         }
     
-    # Get all prospects
-    all_prospects = prospects_data.get('prospects', [])
-    print(f"📊 Total prospects: {len(all_prospects)}")
-    
-    # Filter only NEW prospects (not yet contacted)
-    new_prospects = [p for p in all_prospects if p.get('status') == 'new']
+    # 3️⃣ Get NEW prospects only (not yet contacted)
+    new_prospects = get_prospects_by_status(client_id, platform, 'new')
+    print(f"📊 Total prospects: {len(prospects_data.get('prospects', []))}")
     print(f"🆕 New prospects to contact: {len(new_prospects)}")
     
     if not new_prospects:
@@ -94,14 +62,14 @@ def generate_message(client_id: str):
         return {
             "status": "all_contacted",
             "message": "All prospects have already been contacted",
-            "total_prospects": len(all_prospects)
+            "total_prospects": len(prospects_data.get('prospects', []))
         }
 
-    # 3️⃣ Get first new prospect to contact
+    # 4️⃣ Get first new prospect to generate message for
     target_prospect = new_prospects[0]
     print(f"🎯 Target prospect: @{target_prospect.get('username')}")
 
-    # 4️⃣ Generate message via CrewAI
+    # 5️⃣ Generate message via CrewAI
     print(f"🤖 Generating personalized message...")
     safe_client_data = convert_objectid_to_str(client_data)
     
@@ -111,83 +79,38 @@ def generate_message(client_id: str):
     result = kickoff_message_generation(safe_client_data)
     cleaned_message = safe_serialize(result)
 
-    # 5️⃣ Save message to DB
-    db_service.update_client_generated_message(client_id, {
+    # 6️⃣ Save message to DB (but DON'T send yet)
+    update_client_generated_message(client_id, {
         "generated_messages": cleaned_message,
         "generated_at": datetime.utcnow(),
-        "target_prospect_username": target_prospect.get('username')
+        "target_prospect_username": target_prospect.get('username'),
+        "message_status": "generated_not_sent"  # Track that message is ready but not sent
     })
 
-    # 6️⃣ Auto-send based on platform
-    if platform == "gmail":
-        print(f"📧 Auto-sending Gmail...")
-        auto_send_gmail(client_id)
-        
-        # Update prospect status
-        update_prospect_status(
-            client_id, 
-            platform, 
-            target_prospect.get('username'), 
-            'contacted'
-        )
-
-    elif platform == "instagram":
-        print(f"💬 Auto-sending Instagram DM...")
-        
-        recipient_username = target_prospect.get("username")
-        message_content = (
-            cleaned_message.get("message")
-            if isinstance(cleaned_message, dict)
-            else str(cleaned_message)
-        )
-        
-        try:
-            result = send_instagram_dm(recipient_username, message_content, client_id)
-            
-            # Only update status if DM actually sent successfully
-            if result and result.get("status") == "success":
-                update_prospect_status(
-                    client_id, 
-                    platform, 
-                    recipient_username, 
-                    'contacted'
-                )
-                print(f"✅ DM sent and status updated for @{recipient_username}")
-            else:
-                print(f"⚠️  DM send status unclear, not updating prospect status")
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ DM FAILED: {error_msg}")
-            
-            # Mark prospect as 'failed' instead of 'contacted'
-            update_prospect_status(
-                client_id, 
-                platform, 
-                recipient_username, 
-                'failed'
-            )
-            
-            return {
-                "status": "dm_failed", 
-                "error": error_msg,
-                "prospect": recipient_username,
-                "action_required": "Check Apify account - Actor may need payment or credits"
-            }
+    print(f"✅ Message generated and saved for @{target_prospect.get('username')}")
+    print(f"💬 Message preview: {str(cleaned_message)[:100]}...")
+    print(f"\n✅ Message generation completed for {client_id}\n")
     
-    elif platform == "linkedin":
-        print(f"💼 LinkedIn messaging not yet implemented")
-        # TODO: Implement LinkedIn messaging
-        
-    elif platform == "facebook":
-        print(f"📘 Facebook messaging not yet implemented")
-        # TODO: Implement Facebook messaging
-
-    print(f"\n✅ Pipeline completed for {client_id}\n")
     return {
         "status": "success",
         "platform": platform,
-        "prospect_contacted": target_prospect.get('username'),
+        "prospect_username": target_prospect.get('username'),
+        "message_generated": True,
         "remaining_new_prospects": len(new_prospects) - 1,
         "result": cleaned_message
     }
+
+
+# LEGACY FUNCTION - Keep for backwards compatibility but mark as deprecated
+def generate_message(client_id: str):
+    """
+    ⚠️  DEPRECATED: This function generates AND sends messages
+    Use generate_messages_for_prospects() + send_dm_message() instead
+    
+    This function is kept for backwards compatibility only
+    """
+    print("⚠️  WARNING: Using deprecated generate_message() function")
+    print("⚠️  Please use generate_messages_for_prospects() + send_dm_message() instead")
+    
+    # Just call the new function
+    return generate_messages_for_prospects(client_id)

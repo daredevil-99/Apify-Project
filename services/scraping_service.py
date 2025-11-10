@@ -44,7 +44,7 @@ def scrape_and_store(client_id: str, platform: str, search_terms: List[str],
 
 
 # ========================================
-# PROSPECT EXTRACTION METHODS - ADD THESE
+# HELPER FUNCTIONS
 # ========================================
 
 def extract_mentions_from_text(text: str) -> List[str]:
@@ -54,6 +54,28 @@ def extract_mentions_from_text(text: str) -> List[str]:
     mentions = re.findall(r'@(\w+)', text)
     return mentions
 
+
+def extract_email_from_text(text: str) -> str:
+    """Extract email from text"""
+    if not text:
+        return ""
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = re.findall(email_pattern, text)
+    return emails[0] if emails else ""
+
+
+def extract_phone_from_text(text: str) -> str:
+    """Extract phone number from text"""
+    if not text:
+        return ""
+    phone_pattern = r'[\+]?[(]?[0-9]{1,4}[)]?[-\s\.]?[(]?[0-9]{1,4}[)]?[-\s\.]?[0-9]{1,4}[-\s\.]?[0-9]{1,9}'
+    phones = re.findall(phone_pattern, text)
+    return phones[0] if phones else ""
+
+
+# ========================================
+# INSTAGRAM PROSPECT EXTRACTION
+# ========================================
 
 def extract_prospects_from_instagram_posts(posts_data: List[Dict]) -> List[Dict]:
     """
@@ -133,6 +155,167 @@ def extract_prospects_from_instagram_posts(posts_data: List[Dict]) -> List[Dict]
     return prospect_list
 
 
+# ========================================
+# LINKEDIN PROSPECT EXTRACTION
+# ========================================
+
+def extract_prospects_from_linkedin_profiles(profiles_data: List[Dict]) -> List[Dict]:
+    """
+    Extract prospect profiles from LinkedIn search results
+    LinkedIn data is already profile-based, so we just need to format it
+    """
+    prospects = []
+    
+    print("\n🔍 Extracting prospects from LinkedIn profiles...")
+    
+    for profile in profiles_data:
+        username = profile.get('username', '')
+        if not username:
+            continue
+        
+        # Extract contact info from about/summary
+        about_text = profile.get('about', '')
+        email = extract_email_from_text(about_text)
+        phone = extract_phone_from_text(about_text)
+        
+        # Build prospect profile
+        prospect = {
+            'platform': 'linkedin',
+            'username': username,
+            'full_name': profile.get('full_name', ''),
+            'profile_url': profile.get('profile_url', ''),
+            'profile_pic_url': profile.get('profile_pic_url', ''),
+            'headline': profile.get('headline', ''),
+            'location': profile.get('location', ''),
+            'bio': about_text,
+            'email': email,
+            'phone': phone,
+            'website': '',
+            
+            # LinkedIn specific
+            'current_company': profile.get('current_company', ''),
+            'current_position': profile.get('current_position', ''),
+            'connections_count': profile.get('connections_count', 0),
+            'followers_count': profile.get('followers_count', 0),
+            'is_premium': profile.get('is_premium', False),
+            'is_open_to_work': profile.get('is_open_to_work', False),
+            
+            # Professional background
+            'experience': profile.get('experience', []),
+            'education': profile.get('education', []),
+            'skills': profile.get('skills', []),
+            
+            # Engagement data
+            'engagement_data': {
+                'posts_count': profile.get('posts_count', 0),
+                'recent_posts': profile.get('posts', [])[:3],  # Keep last 3 posts
+                'search_query': profile.get('search_query', ''),
+                'discovered_date': datetime.now().isoformat()
+            },
+            
+            'status': 'new',
+            'last_contacted': None,
+            'created_at': datetime.now().isoformat()
+        }
+        prospects.append(prospect)
+        print(f"  ✓ Found prospect: {prospect['full_name']} ({username})")
+    
+    print(f"\n📊 Total unique prospects found: {len(prospects)}")
+    return prospects
+
+
+# ========================================
+# FACEBOOK PROSPECT EXTRACTION
+# ========================================
+
+def extract_prospects_from_facebook_posts(posts_data: List[Dict]) -> List[Dict]:
+    """
+    Extract prospect profiles from Facebook posts
+    Focus on post authors and engaged commenters
+    """
+    prospects = {}
+    
+    print("\n🔍 Extracting prospects from Facebook posts...")
+    
+    for post in posts_data:
+        # Method 1: Extract post author as prospect
+        author_url = post.get('author_url', '')
+        if author_url and author_url not in prospects:
+            author_name = post.get('author_name', '')
+            
+            # Try to extract username from URL
+            username = author_url.split('/')[-1] if author_url else ''
+            
+            prospects[author_url] = {
+                'platform': 'facebook',
+                'username': username,
+                'full_name': author_name,
+                'profile_url': author_url,
+                'profile_pic_url': post.get('author_profile_pic', ''),
+                'bio': '',
+                'email': '',
+                'phone': '',
+                'website': '',
+                
+                # Engagement metrics from their post
+                'engagement_data': {
+                    'post_url': post.get('post_url', ''),
+                    'post_text': post.get('text', '')[:200],
+                    'likes': post.get('likes', 0),
+                    'comments': post.get('comments_count', 0),
+                    'shares': post.get('shares', 0),
+                    'discovered_date': datetime.now().isoformat()
+                },
+                
+                'status': 'new',
+                'last_contacted': None,
+                'created_at': datetime.now().isoformat()
+            }
+            print(f"  ✓ Found author prospect: {author_name}")
+        
+        # Method 2: Extract engaged commenters (top commenters)
+        comment_details = post.get('comment_details', [])
+        for comment in comment_details[:10]:  # Top 10 commenters
+            commenter_url = comment.get('authorUrl', '')
+            commenter_name = comment.get('authorName', '')
+            
+            if commenter_url and commenter_url not in prospects:
+                username = commenter_url.split('/')[-1] if commenter_url else ''
+                
+                prospects[commenter_url] = {
+                    'platform': 'facebook',
+                    'username': username,
+                    'full_name': commenter_name,
+                    'profile_url': commenter_url,
+                    'profile_pic_url': '',
+                    'bio': '',
+                    'email': '',
+                    'phone': '',
+                    'website': '',
+                    
+                    # Engagement context
+                    'engagement_data': {
+                        'commented_on_post': post.get('post_url', ''),
+                        'comment_text': comment.get('text', '')[:200],
+                        'comment_likes': comment.get('likes', 0),
+                        'discovered_date': datetime.now().isoformat()
+                    },
+                    
+                    'status': 'new',
+                    'last_contacted': None,
+                    'created_at': datetime.now().isoformat()
+                }
+                print(f"  ✓ Found commenter prospect: {commenter_name}")
+    
+    prospect_list = list(prospects.values())
+    print(f"\n📊 Total unique prospects found: {len(prospect_list)}")
+    return prospect_list
+
+
+# ========================================
+# MAIN EXTRACTION FUNCTION
+# ========================================
+
 def extract_and_store_prospects(client_id: str, platform: str) -> Dict:
     """
     Main function: Extract prospects from scraped data and store in audience collection
@@ -166,27 +349,23 @@ def extract_and_store_prospects(client_id: str, platform: str) -> Dict:
                 "message": "No scraped data found. Run scraping first."
             }
         
-        print(f"📄 Found {len(posts)} posts to analyze")
+        print(f"📄 Found {len(posts)} items to analyze")
         
         # Extract prospects based on platform
         if platform.lower() == "instagram":
             prospects = extract_prospects_from_instagram_posts(posts)
         elif platform.lower() == "linkedin":
-            # TODO: Implement LinkedIn extraction
-            print("⚠️  LinkedIn prospect extraction not yet implemented")
-            prospects = []
+            prospects = extract_prospects_from_linkedin_profiles(posts)
         elif platform.lower() == "facebook":
-            # TODO: Implement Facebook extraction
-            print("⚠️  Facebook prospect extraction not yet implemented")
-            prospects = []
+            prospects = extract_prospects_from_facebook_posts(posts)
         else:
             return {
                 "status": "error",
-                "message": f"Platform {platform} not yet supported for prospect extraction"
+                "message": f"Platform {platform} not supported for prospect extraction"
             }
         
         if not prospects:
-            print("⚠️  No prospects found in the posts")
+            print("⚠️  No prospects found in the data")
             return {
                 "status": "warning",
                 "message": "No prospects found in the scraped data",

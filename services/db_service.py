@@ -19,14 +19,14 @@ class ClientRegistration(BaseModel):
     preferred_location: str
 
 
-def register_client(data: ClientRegistration) -> Dict:
+def register_client(data: dict) -> Dict:
     """Register new client and return UUID"""
-    platform = data.platform.lower()
+    platform = data.get("platform", "").lower()
     if platform not in ["instagram", "linkedin", "facebook"]:
         return {"error": "Invalid platform"}
 
     client_id = str(uuid4())
-    client_info = data.dict()
+    client_info = data.copy()
     client_info["client_id"] = client_id
     client_info["platform"] = platform
     client_info["status"] = "registered"
@@ -37,6 +37,7 @@ def register_client(data: ClientRegistration) -> Dict:
         "message": f"Client registered for {platform.upper()}",
         "client_id": client_id
     }
+
 
 
 def get_client_data(client_id: str) -> Optional[Dict]:
