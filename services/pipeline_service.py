@@ -90,15 +90,19 @@ def generate_messages_for_prospects(client_id: str):
     print(f"✅ Message generated and saved for @{target_prospect.get('username')}")
     print(f"💬 Message preview: {str(cleaned_message)[:100]}...")
     print(f"\n✅ Message generation completed for {client_id}\n")
-    
+
+    # Return a consistent result structure so callers (FastAPI endpoint) can rely on it
     return {
         "status": "success",
+        "success": True,                                # <-- explicit boolean
         "platform": platform,
         "prospect_username": target_prospect.get('username'),
+        "username": target_prospect.get('username'),    # <-- friendly alias used by endpoint
         "message_generated": True,
         "remaining_new_prospects": len(new_prospects) - 1,
         "result": cleaned_message
     }
+
 
 
 # LEGACY FUNCTION - Keep for backwards compatibility but mark as deprecated

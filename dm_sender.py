@@ -32,10 +32,10 @@ class ApifyDMSender:
     def send_instagram_dm(self, username: str, message: str) -> Dict:
         """
         Send Instagram DM using Apify's Instagram DM sender
-        Actor: apify/instagram-dm-sender or similar
+        Actor: bhansalisoft/instagram-bulk-message-sender or similar
         """
         try:
-            actor_id = "apify/instagram-dm-sender"  # Check Apify store for exact actor
+            actor_id = "bhansalisoft/instagram-bulk-message-sender"  # Check Apify store for exact actor
             
             run_input = {
                 "username": username,

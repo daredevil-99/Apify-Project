@@ -337,12 +337,30 @@ class FetchFromMongoTool(BaseTool):
     def _standardize_instagram_profile(self, raw_profile: Dict) -> Dict:
         """Standardize Instagram profile data"""
         try:
-            username = self._extract_username_from_url(raw_profile.get("url", ""))
-            if username == "instagram_user":
-                username = f"user_{raw_profile.get('ownerId', 'unknown')}"
+            # ✅ FIX: Use ownerUsername directly, not post URL
+            username = raw_profile.get("ownerUsername") or raw_profile.get("username")
+            
+            if not username:
+                # Fallback: try to extract from profile_url (not post url)
+                profile_url = raw_profile.get("profile_url", "")
+                if profile_url and "instagram.com/" in profile_url:
+                    username = profile_url.rstrip('/').split('/')[-1]
+                else:
+                    # Last resort: use owner_id
+                    username = f"user_{raw_profile.get('ownerId', 'unknown')}"
+            
+            # Remove invalid usernames
+            if username in ['p', 'reel', 'tv', 'stories']:
+                username = raw_profile.get("ownerFullName") or f"user_{raw_profile.get('ownerId', 'unknown')}"
             
             caption = raw_profile.get("caption", "")
-            bio_content = self._extract_bio_from_caption(caption)
+            
+            # ✅ Use ownerFullName or extract from caption for bio
+            bio_content = (
+                raw_profile.get("ownerFullName") or 
+                self._extract_bio_from_caption(caption) or
+                "Instagram content creator"
+            )
             
             has_valid_content = bool(
                 caption or 
@@ -351,6 +369,11 @@ class FetchFromMongoTool(BaseTool):
             )
             
             engagement_score = self._calculate_engagement_score(raw_profile)
+            
+            # ✅ Build proper profile URL
+            profile_url = raw_profile.get("profile_url")
+            if not profile_url or "/p/" in profile_url:
+                profile_url = f"https://www.instagram.com/{username}/"
             
             return {
                 "username": username,
@@ -364,7 +387,7 @@ class FetchFromMongoTool(BaseTool):
                     "comments": raw_profile.get("commentsCount", 0),
                     "url": raw_profile.get("url", "")
                 }],
-                "profile_url": f"https://www.instagram.com/{username}/",
+                "profile_url": profile_url,
                 "post_engagement": {
                     "likes": raw_profile.get("likesCount", 0),
                     "comments": raw_profile.get("commentsCount", 0),
@@ -374,11 +397,14 @@ class FetchFromMongoTool(BaseTool):
                 "post_date": raw_profile.get("timestamp", ""),
                 "relevance_score": raw_profile.get("relevance_score", 0),
                 "location_relevance_score": raw_profile.get("location_relevance_score", 0),
-                "owner_id": raw_profile.get("ownerId", "")
+                "owner_id": raw_profile.get("ownerId", ""),
+                "owner_full_name": raw_profile.get("ownerFullName", "")
             }
                 
         except Exception as e:
             print(f"❌ Error standardizing Instagram profile: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _extract_bio_from_caption(self, caption: str) -> str:

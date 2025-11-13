@@ -1,39 +1,100 @@
-# instagram_dm_sender.py
-# UPDATE YOUR EXISTING FILE WITH BETTER ERROR HANDLING
-
 import os
+import json
+import re
 from apify_client import ApifyClient
+from pymongo import MongoClient
+
+# MongoDB Connection
+mongo_uri = os.getenv("MONGO_URI")
+if not mongo_uri:
+    raise ValueError("❌ MONGO_URI not found in environment variables")
+
+mongo_client = MongoClient(mongo_uri)
+db = mongo_client["cosmetics_app"]
+audience_collection = db["audience_data"]
+
+
+def sanitize_message(text: str) -> str:
+    """Remove ALL emojis and special characters"""
+    if not text:
+        return ""
+    
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\U00002500-\U00002BEF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "\U0001f926-\U0001f937"
+        "\U00010000-\U0010ffff"
+        "\u2640-\u2642"
+        "\u2600-\u2B55"
+        "\u200d"
+        "\u23cf"
+        "\u23e9"
+        "\u231a"
+        "\ufe0f"
+        "\u3030"
+        "]+",
+        flags=re.UNICODE
+    )
+    
+    clean_text = emoji_pattern.sub(' ', text)
+    clean_text = ' '.join(clean_text.split())
+    return clean_text.strip()
+
 
 def send_instagram_dm(recipient_username: str, message: str, client_id: str = None):
     """
-    Send Instagram DM using Apify Actor with improved error handling
+    ✅ Send Instagram DM using bhansalisoft/instagram-bulk-message-sender
     """
-    print(f"📤 Sending Instagram DM to @{recipient_username}")
-    
-    # Initialize Apify client
+    if not recipient_username:
+        raise ValueError("Recipient username is missing")
+
+    print(f"\n📤 Sending Instagram DM to @{recipient_username}")
+
+    # Clean emojis
+    message = sanitize_message(message)
+
+    # Load APIFY token
     apify_token = os.getenv("APIFY_API_TOKEN")
     if not apify_token:
-        error_msg = "APIFY_API_TOKEN not found in environment variables"
-        print(f"❌ {error_msg}")
-        raise ValueError(error_msg)
-    
+        raise ValueError("❌ APIFY_API_TOKEN not found")
+
     client = ApifyClient(apify_token)
-    
-    # Prepare actor input
+
+    # ✅ Load cookies from JSON file
+    cookies_path = os.getenv("INSTAGRAM_COOKIES_PATH", "cookies.json")
+    if not os.path.exists(cookies_path):
+        raise FileNotFoundError(f"Instagram cookies file not found: {cookies_path}")
+
+    with open(cookies_path, "r", encoding="utf-8") as f:
+        cookies_data = json.load(f)
+
+    # ✅ Prepare actor input for bhansalisoft actor
     run_input = {
-        "username": recipient_username,
-        "message": message,
-        # Add any other required parameters for your Instagram DM actor
+        "Instagram_UserName_List": [recipient_username],
+        "Message": message,
+        "Delay": "5",  # seconds between messages
+        "Cookies": cookies_data
     }
-    
+
     try:
-        # Run the Instagram DM actor
-        # Replace 'YOUR_ACTOR_ID' with your actual actor ID
-        run = client.actor("HCeZTYRGtlUT8Sxx6").call(run_input=run_input)
-        
-        # Check if run was successful
+        # ✅ Run bhansalisoft actor
+        print(f"🚀 Starting Apify actor: bhansalisoft/instagram-bulk-message-sender")
+        run = client.actor("bhansalisoft/instagram-bulk-message-sender").call(
+            run_input=run_input
+        )
+
+        print(f"📊 Actor run status: {run.get('status')}")
+        print(f"🆔 Run ID: {run.get('id')}")
+
         if run.get("status") == "SUCCEEDED":
             print(f"✅ DM sent successfully to @{recipient_username}")
+            
             return {
                 "status": "success",
                 "recipient": recipient_username,
@@ -44,54 +105,22 @@ def send_instagram_dm(recipient_username: str, message: str, client_id: str = No
             error_msg = f"Actor run failed with status: {run.get('status')}"
             print(f"❌ {error_msg}")
             raise Exception(error_msg)
-            
+
     except Exception as e:
         error_msg = str(e)
-        print(f"❌ Failed to send DM to @{recipient_username}: {error_msg}")
+        print(f"❌ Failed to send DM: {error_msg}")
         
-        # Check for specific error types
-        if "free trial has expired" in error_msg or "rent a paid Actor" in error_msg:
+        # Handle known errors
+        if "trial has expired" in error_msg.lower():
             raise Exception(
-                f"❌ APIFY ACTOR TRIAL EXPIRED: You need to rent the Instagram DM Actor. "
-                f"Visit: https://console.apify.com/actors/HCeZTYRGtlUT8Sxx6"
+                "❌ APIFY ACTOR TRIAL EXPIRED\n"
+                "👉 Rent the actor at: https://console.apify.com/actors/bhansalisoft~instagram-bulk-message-sender"
             )
         elif "insufficient credit" in error_msg.lower():
             raise Exception(
-                f"❌ INSUFFICIENT APIFY CREDITS: Please add credits to your Apify account. "
-                f"Visit: https://console.apify.com/billing"
+                "❌ INSUFFICIENT APIFY CREDITS\n"
+                "👉 Add credits at: https://console.apify.com/billing"
             )
         else:
             raise Exception(f"Failed to send Instagram DM: {error_msg}")
 
-
-def send_bulk_instagram_dms(prospects: list, message_template: str, client_id: str = None):
-    """
-    Send Instagram DMs to multiple prospects
-    """
-    results = {
-        "success": [],
-        "failed": [],
-        "total": len(prospects)
-    }
-    
-    for prospect in prospects:
-        username = prospect.get("username")
-        
-        # Personalize message if needed
-        personalized_message = message_template.replace("{name}", prospect.get("full_name", username))
-        
-        try:
-            send_instagram_dm(username, personalized_message, client_id)
-            results["success"].append(username)
-        except Exception as e:
-            results["failed"].append({
-                "username": username,
-                "error": str(e)
-            })
-            print(f"⚠️  Skipping @{username} due to error")
-    
-    print(f"\n📊 Bulk DM Results:")
-    print(f"   ✅ Successful: {len(results['success'])}")
-    print(f"   ❌ Failed: {len(results['failed'])}")
-    
-    return results

@@ -1,6 +1,8 @@
+#routes.py
+
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from services.db_service import register_client, get_client_data, get_prospects_from_audience
 from services.scraping_service import scrape_and_store, extract_and_store_prospects
 from services.pipeline_service import generate_messages_for_prospects
@@ -24,7 +26,7 @@ class ClientRegistration(BaseModel):
 
 
 class LinkedInInput(BaseModel):
-    searchQuery: str
+    searchQuery: Optional[str] = None
     profileScraperMode: str = "Full"
     startPage: int = 1
 
@@ -59,7 +61,7 @@ async def register_client_endpoint(client_data: ClientRegistration):
 async def scrape_endpoint(
     client_id: str,
     background_tasks: BackgroundTasks,
-    linkedin_input: LinkedInInput | None = None
+    linkedin_input: Optional[LinkedInInput] = None
 ):
     """
     Scrape posts/profiles from the client's target platform and save results in DB.
@@ -70,34 +72,43 @@ async def scrape_endpoint(
         raise HTTPException(status_code=404, detail="Client not found")
 
     platform = client_data.get("platform", "").lower()
-
-    # 🟣 Platform-specific logic
-    if platform == "linkedin":
-        if not linkedin_input:
-            raise HTTPException(
-                status_code=400,
-                detail="LinkedIn scraping requires 'searchQuery' and optional mode/page"
-            )
-        background_tasks.add_task(
-            scrape_and_store,
-            client_id,
-            platform,
-            linkedin_input.searchQuery,
-            linkedin_input.profileScraperMode,
-            linkedin_input.startPage
-        )
-        return {
-            "message": "🚀 LinkedIn scraping started",
-            "client_id": client_id,
-            "platform": "LinkedIn",
-            "query": linkedin_input.searchQuery,
-        }
-
-    # 🟣 Instagram / Facebook logic
+    
+    # Get client data for scraping
     search_terms = client_data.get("search_terms", [])
     profession = client_data.get("profession", "")
     location = client_data.get("location", "")
 
+    print(f"🔍 Client data - Platform: {platform}")
+    print(f"🔍 Search terms: {search_terms}")
+    print(f"🔍 Profession: {profession}")
+    print(f"🔍 Location: {location}")
+
+    # 🟣 Platform-specific logic
+    if platform == "linkedin":
+        # ✅ FIX: Pass client data properly to scraping function
+        # The scraping function will handle building the query from search_terms, profession, location
+        
+        background_tasks.add_task(
+            scrape_and_store,
+            client_id,
+            platform,
+            search_terms,      # ✅ Pass search terms as list
+            profession,        # ✅ Pass profession string
+            location          # ✅ Pass location string
+        )
+        
+        return {
+            "message": "🚀 LinkedIn scraping started",
+            "client_id": client_id,
+            "platform": "LinkedIn",
+            "search_params": {
+                "search_terms": search_terms,
+                "profession": profession,
+                "location": location
+            }
+        }
+
+    # 🟣 Instagram / Facebook logic
     if not search_terms:
         raise HTTPException(status_code=400, detail="No search terms found for this client")
 
@@ -144,15 +155,28 @@ async def extract_prospects_endpoint(client_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============================================================
-# 4️⃣ Generate Outreach Messages
-# ============================================================
 @router.post("/generate-messages/{client_id}")
 def generate_messages(client_id: str):
     """
     Step 4️⃣ - Generate personalized outreach messages for extracted prospects.
     """
-    return generate_messages_for_prospects(client_id)
+    try:
+        result = generate_messages_for_prospects(client_id)
+
+        # ✅ Log the correct username dynamically from the result
+        if result.get("success") or result.get("status") == "success":
+            username = result.get("username") or result.get("prospect_username")
+            print(f"✅ Message generated and saved for @{username}")
+        else:
+            print(f"⚠️ Message generation did not succeed for client_id={client_id}")
+            print(f"➡️ Result: {result}")
+
+        return result
+
+    except Exception as e:
+        print(f"❌ Error while generating messages for {client_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ============================================================
