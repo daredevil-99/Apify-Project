@@ -10,7 +10,7 @@ token.json
 credentials.json
 apify_storage/
 apify.json
-
+cookies.json
 # 🧠 Python cache
 __pycache__/
 *.pyc
