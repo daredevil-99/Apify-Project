@@ -36,41 +36,41 @@ class FetchFromMongoTool(BaseTool):
     
     def _run(self, client_id: str = None, platform: str = None, search_terms: List[str] = None, limit: int = 1):
         try:
-            # Build query with strict platform filtering
-            query = {}
+            # Build query - fetch prospects without generated messages
+            query = {"type": "prospects"}  # ✅ Look in prospects array
+            
             if client_id:
                 query["client_id"] = client_id
             if platform:
                 query["platform"] = platform.lower()
 
             print(f"🔍 MongoDB Query: {query}")
-            print(f"🔍 Search Terms: {search_terms}")
-            print(f"🔍 Platform Filter: {platform}")
             
-            # Sort by location relevance first, then fetch
-            sort_criteria = [
-                ("location_relevance_score", -1),
-                ("fetched_at", -1)
+            # Get the prospects document
+            prospects_doc = audience_collection.find_one(query)
+            
+            if not prospects_doc:
+                print(f"❌ No prospects document found")
+                return {"error": f"No {platform} prospects found", "platform": platform}
+            
+            # ✅ Filter prospects that don't have messages yet
+            all_prospects = prospects_doc.get("prospects", [])
+            prospects_without_messages = [
+                p for p in all_prospects 
+                if not p.get("generated_message")
             ]
             
-            all_results = list(
-                audience_collection.find(query, {"_id": 0})
-                .sort(sort_criteria)
-                .limit(50)
-            )
+            print(f"📊 Found {len(all_prospects)} total prospects")
+            print(f"📝 {len(prospects_without_messages)} prospects need messages")
             
-            print(f"📊 Found {len(all_results)} total profiles for {platform.upper()}")
+            if not prospects_without_messages:
+                return {
+                    "error": "All prospects already have messages",
+                    "platform": platform
+                }
             
-            if all_results:
-                top_scores = [r.get('location_relevance_score', 0) for r in all_results[:5]]
-                print(f"📍 Top 5 location scores: {top_scores}")
-            
-            if not all_results:
-                print(f"❌ No data found for platform: {platform}")
-                return {"error": f"No {platform} data found", "platform": platform}
-
-            # Validate data quality
-            valid_results = self._validate_platform_data(all_results, platform)
+            # Validate data quality on filtered prospects
+            valid_results = self._validate_platform_data(prospects_without_messages, platform)
             
             if not valid_results:
                 print(f"❌ No valid {platform} data found after validation")
@@ -108,15 +108,16 @@ class FetchFromMongoTool(BaseTool):
                 }
             
             selected_profile = processed_profiles[0]
-            location_score = selected_profile.get('location_relevance_score', 0)
-            print(f"✅ Selected profile with location score: {location_score}")
-            print(f"✅ Processed {len(processed_profiles)} valid {platform} profiles")
+            print(f"✅ Selected prospect: @{selected_profile.get('username')}")
             
             return selected_profile
 
         except Exception as e:
             print(f"❌ Error in FetchFromMongoTool: {e}")
             return {"error": str(e), "platform": platform or "unknown"}
+
+
+    
 
     def _validate_platform_data(self, profiles: List[Dict], platform: str) -> List[Dict]:
         """Validate that profiles have meaningful content"""

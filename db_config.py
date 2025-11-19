@@ -1,4 +1,3 @@
-# db_config.py (COMPLETE VERSION)
 import os
 import pymongo
 from apify_client import ApifyClient
@@ -33,10 +32,10 @@ def get_clients_collection():
 def get_audience_collection():
     return get_database()["audience_data"]
 
-# ✅ BACKWARD COMPATIBILITY
+# Backward compatibility
 audience_collection = get_audience_collection()
 clients_collection = get_clients_collection()
 db = get_database()
 
-# ✅ APIFY CLIENT
+# APIFY CLIENT
 apify_client = ApifyClient(APIFY_API_TOKEN)

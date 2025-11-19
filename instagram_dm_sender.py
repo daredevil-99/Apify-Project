@@ -49,7 +49,7 @@ def sanitize_message(text: str) -> str:
 
 def send_instagram_dm(recipient_username: str, message: str, client_id: str = None):
     """
-    ✅ Send Instagram DM using bhansalisoft/instagram-bulk-message-sender
+    Send Instagram DM using bhansalisoft/instagram-bulk-message-sender
     """
     if not recipient_username:
         raise ValueError("Recipient username is missing")
@@ -66,7 +66,7 @@ def send_instagram_dm(recipient_username: str, message: str, client_id: str = No
 
     client = ApifyClient(apify_token)
 
-    # ✅ Load cookies from JSON file
+    # Load cookies
     cookies_path = os.getenv("INSTAGRAM_COOKIES_PATH", "cookies.json")
     if not os.path.exists(cookies_path):
         raise FileNotFoundError(f"Instagram cookies file not found: {cookies_path}")
@@ -74,27 +74,25 @@ def send_instagram_dm(recipient_username: str, message: str, client_id: str = No
     with open(cookies_path, "r", encoding="utf-8") as f:
         cookies_data = json.load(f)
 
-    # ✅ Prepare actor input for bhansalisoft actor
+    # Actor input
     run_input = {
         "Instagram_UserName_List": [recipient_username],
         "Message": message,
-        "Delay": "5",  # seconds between messages
+        "Delay": "5",
         "Cookies": cookies_data
     }
 
     try:
-        # ✅ Run bhansalisoft actor
         print(f"🚀 Starting Apify actor: bhansalisoft/instagram-bulk-message-sender")
         run = client.actor("bhansalisoft/instagram-bulk-message-sender").call(
             run_input=run_input
         )
 
-        print(f"📊 Actor run status: {run.get('status')}")
+        print(f"📊 Status: {run.get('status')}")
         print(f"🆔 Run ID: {run.get('id')}")
 
         if run.get("status") == "SUCCEEDED":
             print(f"✅ DM sent successfully to @{recipient_username}")
-            
             return {
                 "status": "success",
                 "recipient": recipient_username,
@@ -102,25 +100,21 @@ def send_instagram_dm(recipient_username: str, message: str, client_id: str = No
                 "run_id": run.get("id")
             }
         else:
-            error_msg = f"Actor run failed with status: {run.get('status')}"
-            print(f"❌ {error_msg}")
-            raise Exception(error_msg)
+            raise Exception(f"Actor failed: {run.get('status')}")
 
     except Exception as e:
         error_msg = str(e)
         print(f"❌ Failed to send DM: {error_msg}")
-        
-        # Handle known errors
+
         if "trial has expired" in error_msg.lower():
             raise Exception(
                 "❌ APIFY ACTOR TRIAL EXPIRED\n"
-                "👉 Rent the actor at: https://console.apify.com/actors/bhansalisoft~instagram-bulk-message-sender"
+                "👉 Rent actor: https://console.apify.com/actors/bhansalisoft~instagram-bulk-message-sender"
             )
         elif "insufficient credit" in error_msg.lower():
             raise Exception(
                 "❌ INSUFFICIENT APIFY CREDITS\n"
-                "👉 Add credits at: https://console.apify.com/billing"
+                "👉 Add credits: https://console.apify.com/billing"
             )
         else:
             raise Exception(f"Failed to send Instagram DM: {error_msg}")
-
