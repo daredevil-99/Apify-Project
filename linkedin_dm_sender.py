@@ -3,12 +3,85 @@ import os
 import time
 import random
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from datetime import datetime
+import json
 
 load_dotenv() 
+
+# MongoDB Connection
+mongo_uri = os.getenv("MONGO_URI")
+if not mongo_uri:
+    raise ValueError("❌ MONGO_URI not found in environment variables")
+
+mongo_client = MongoClient(mongo_uri)
+db = mongo_client["cosmetics_app"]
+clients_collection = db["clients"]
+audience_collection = db["audience_data"]
+
+
+def get_linkedin_cookies_from_db(client_id: str):
+    """
+    Fetch LinkedIn cookies from MongoDB for the given client_id.
+    Validates expiry and returns cookie data as JSON string.
+    """
+    client = clients_collection.find_one(
+        {"client_id": client_id},
+        {"cookies": 1, "_id": 0}
+    )
+    
+    if not client:
+        raise ValueError(f"❌ Client {client_id} not found in database")
+    
+    if "cookies" not in client:
+        raise ValueError(f"❌ No cookies found for client {client_id}")
+    
+    linkedin_cookies = client["cookies"].get("linkedin")
+    
+    if not linkedin_cookies:
+        raise ValueError(
+            f"❌ No LinkedIn cookies found for client {client_id}\n"
+            "👉 Upload cookies via: POST /pipeline/cookies-file/{client_id}"
+        )
+    
+    # Check if cookies are expired
+    expires_at = linkedin_cookies.get("expires_at")
+    if expires_at:
+        expiry_date = datetime.fromisoformat(expires_at)
+        if datetime.utcnow() > expiry_date:
+            raise ValueError(
+                f"❌ LinkedIn cookies expired on {expires_at}\n"
+                "👉 Please re-upload cookies via: POST /pipeline/cookies-file/{client_id}"
+            )
+    
+    # Check if cookies are marked as inactive
+    if not linkedin_cookies.get("is_active", True):
+        raise ValueError(
+            f"❌ LinkedIn cookies are marked as inactive\n"
+            "👉 Please re-upload cookies via: POST /pipeline/cookies-file/{client_id}"
+        )
+    
+    cookies_data = linkedin_cookies.get("data")
+    
+    if not cookies_data:
+        raise ValueError(f"❌ Cookie data is empty for client {client_id}")
+    
+    # Convert cookie array to JSON string (actor expects string format)
+    if isinstance(cookies_data, list):
+        cookies_json = json.dumps(cookies_data)
+    elif isinstance(cookies_data, str):
+        cookies_json = cookies_data
+    else:
+        cookies_json = json.dumps([cookies_data])
+    
+    print(f"✅ Loaded LinkedIn cookies from database (client: {client_id})")
+    return cookies_json
+
 
 def send_linkedin_dm(profile_url: str, message: str, client_id: str):
     """
     ✅ WORKING VERSION - Sends LinkedIn DM using noddsolutions actor
+    Fetches cookies from MongoDB instead of .env file.
     
     Returns:
         dict: {
@@ -24,15 +97,28 @@ def send_linkedin_dm(profile_url: str, message: str, client_id: str):
                 "message_sent": False,
                 "error": "missing_profile_url"
             }
-
-        # ✅ Get credentials
-        apify_token = os.getenv("APIFY_API_TOKEN")
-        linkedin_cookie = os.getenv("LINKEDIN_COOKIE")  # Full cookie JSON string
         
+        if not client_id:
+            return {
+                "status": "failed",
+                "message_sent": False,
+                "error": "client_id is required to fetch cookies"
+            }
+
+        # ✅ Get APIFY token
+        apify_token = os.getenv("APIFY_API_TOKEN")
         if not apify_token:
             raise ValueError("Missing APIFY_API_TOKEN in .env file")
-        if not linkedin_cookie:
-            raise ValueError("Missing LINKEDIN_COOKIE in .env file")
+
+        # ✅ Fetch LinkedIn cookies from MongoDB
+        try:
+            linkedin_cookie = get_linkedin_cookies_from_db(client_id)
+        except Exception as e:
+            return {
+                "status": "failed",
+                "message_sent": False,
+                "error": f"Failed to load cookies: {str(e)}"
+            }
 
         client = ApifyClient(apify_token)
         
@@ -47,10 +133,9 @@ def send_linkedin_dm(profile_url: str, message: str, client_id: str):
             "linkedinCookie": linkedin_cookie,
             "maxMessages": 1,
             "waitBetweenRequests": [3, 5],
-            # Try without proxy first (comment out if it doesn't work)
             "proxyConfiguration": {
-                  "useApifyProxy": True
-                }
+                "useApifyProxy": True
+            }
         }
 
         print(f"🚀 Sending LinkedIn DM to {profile_url}...")
@@ -168,7 +253,13 @@ def get_linkedin_cookie_from_browser():
     4. Click "Export" button (looks like a download icon)
        This copies ALL cookies to clipboard as JSON
     
-    5. Paste in your .env file:
+    5. Upload via API:
+       POST /pipeline/cookies-file/{client_id}
+       Form data: 
+         - platform: linkedin
+         - file: [cookies.json file]
+    
+    OR paste in your .env file (legacy):
        LINKEDIN_COOKIE='[{"name":"li_at","value":"AQE..."},...all cookies...]'
     
     IMPORTANT: Use the FULL cookie array, not just li_at!
@@ -180,8 +271,17 @@ def get_linkedin_cookie_from_browser():
 def process_linkedin_dms(prospects, client_id):
     """
     Process LinkedIn DMs with proper error handling and rate limiting
-    No database - just sends messages and returns results
+    Requires client_id to fetch cookies from database
     """
+    if not client_id:
+        print("❌ client_id is required to process LinkedIn DMs")
+        return {
+            "successful": 0,
+            "failed": len(prospects),
+            "results": [],
+            "error": "client_id is required"
+        }
+    
     successful = 0
     failed = 0
     results = []
@@ -249,18 +349,24 @@ def process_linkedin_dms(prospects, client_id):
 
 
 def test_single_linkedin_dm():
-    """Test sending a single DM"""
+    """Test sending a single DM - requires client_id"""
+    client_id = input("Enter client_id to test: ").strip()
+    
+    if not client_id:
+        print("❌ client_id is required")
+        return
+    
     test_prospect = {
         "id": "test_123",
-        "name": "Dharani",
-        "profile_url": "https://www.linkedin.com/in/kdharani-ai/",
+        "name": "Test User",
+        "profile_url": "https://www.linkedin.com/in/test-profile/",
         "message": "Hi! This is a test message from my automation system."
     }
     
     result = send_linkedin_dm(
         test_prospect["profile_url"],
         test_prospect["message"],
-        "test_client"
+        client_id
     )
     
     print(f"\n🧪 Test Result: {result}")
@@ -268,7 +374,7 @@ def test_single_linkedin_dm():
 
 
 if __name__ == "__main__":
+    print("🔧 LinkedIn DM Sender - MongoDB Cookie Integration\n")
     get_linkedin_cookie_from_browser()
+    print("\n" + "="*60 + "\n")
     test_single_linkedin_dm()
-
-

@@ -1,14 +1,25 @@
 # routes.py - CLEANED UP VERSION
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Body
+from pydantic import BaseModel, field_validator
+from typing import List, Optional, Any, Union
 from datetime import datetime
-from services.db_service import register_client, get_client_data, get_prospects_from_audience
+from services.db_service import (
+    register_client, 
+    get_client_data, 
+    get_prospects_from_audience,
+    save_client_cookies,
+    get_cookie_status
+)
 from services.scraping_service import scrape_and_store, extract_and_store_prospects
 from services.pipeline_service import generate_messages_for_prospects
 from services.dm_service import send_dm_message
 from db_config import audience_collection
+from fastapi import UploadFile, File
+import json
+from pydantic import BaseModel, validator
+from typing import List, Optional, Union, Dict, Any
+import re
 
 router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
 
@@ -20,11 +31,78 @@ class ClientRegistration(BaseModel):
     name: str
     role: str
     email: str
-    platform: str  # "instagram", "linkedin", "facebook"
+    platform: str
     search_terms_with_location: List[str]
     preferred_profession: str
     preferred_location: str
 
+from pydantic import BaseModel, field_validator
+from typing import Any, List, Dict, Union
+import json
+import re
+
+class CookieUpload(BaseModel):
+    platform: str
+    cookies: Union[List[Dict[str, Any]], Dict[str, Any], str]
+    
+    @field_validator('platform')
+    @classmethod
+    def validate_platform(cls, v: str) -> str:
+        v = v.lower().strip()
+        if v not in ["instagram", "linkedin", "facebook"]:
+            raise ValueError("Platform must be: instagram, linkedin, or facebook")
+        return v
+    
+    @field_validator('cookies')
+    @classmethod
+    def parse_cookies(cls, v: Any) -> List[Dict[str, Any]]:
+        """
+        Parse cookies from various formats:
+        - Already a list/dict
+        - JSON string (with or without escape characters)
+        - Handle trailing commas, control characters
+        """
+        # If already a list, validate and return
+        if isinstance(v, list):
+            if not v:
+                raise ValueError("Cookies list cannot be empty")
+            return v
+        
+        # If dict, wrap in list
+        if isinstance(v, dict):
+            return [v]
+        
+        # If string, parse it
+        if isinstance(v, str):
+            v = v.strip()
+            
+            if not v:
+                raise ValueError("Cookies string cannot be empty")
+            
+            try:
+                # Remove control characters that break JSON
+                v = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', v)
+                
+                # Remove trailing commas before closing brackets/braces
+                v = re.sub(r',(\s*[}\]])', r'\1', v)
+                
+                # Try to parse as JSON
+                parsed = json.loads(v)
+                
+                # Ensure it's a list
+                if isinstance(parsed, dict):
+                    return [parsed]
+                elif isinstance(parsed, list):
+                    if not parsed:
+                        raise ValueError("Parsed cookies list cannot be empty")
+                    return parsed
+                else:
+                    raise ValueError("Cookies must be a list or dict")
+                    
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON format: {str(e)}. Make sure cookies are valid JSON.")
+        
+        raise ValueError("Cookies must be provided as a list, dict, or valid JSON string")
 
 class LinkedInInput(BaseModel):
     searchQuery: Optional[str] = None
@@ -42,9 +120,6 @@ class SelectiveMessageRequest(BaseModel):
 # ============================================================
 @router.post("/register")
 async def register_client_endpoint(client_data: ClientRegistration):
-    """
-    Register a new client and store their configuration (platform, keywords, etc.)
-    """
     client_dict = client_data.dict()
     client_dict["search_terms"] = client_dict.pop("search_terms_with_location", [])
     client_dict["profession"] = client_dict.pop("preferred_profession", "")
@@ -57,6 +132,56 @@ async def register_client_endpoint(client_data: ClientRegistration):
         "note": "Next step: call /pipeline/scrape/{client_id}"
     }
 
+
+@router.post("/cookies-file/{client_id}")
+async def upload_cookie_file(
+    client_id: str,
+    platform: str,
+    file: UploadFile = File(...)
+):
+    """
+    Upload cookies via JSON file exported from Chrome extension.
+    This avoids copy/paste errors completely.
+    """
+    try:
+        # Validate platform
+        platform = platform.lower().strip()
+        if platform not in ["instagram", "linkedin", "facebook"]:
+            raise HTTPException(status_code=400, detail="Invalid platform.")
+
+        # Check file type
+        if not file.filename.endswith(".json"):
+            raise HTTPException(status_code=400, detail="Upload a .json file only.")
+
+        # Read file content
+        raw_bytes = await file.read()
+        try:
+            cookies_data = json.loads(raw_bytes)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON file. Unable to parse.")
+
+        # Ensure list format
+        if isinstance(cookies_data, dict):
+            cookies_data = [cookies_data]
+        if not isinstance(cookies_data, list):
+            raise HTTPException(status_code=400, detail="JSON must contain cookie array.")
+
+        # Save to DB
+        save_client_cookies(
+            client_id=client_id,
+            platform=platform,
+            cookies_data=cookies_data,
+            expires_in_days=30
+        )
+
+        return {
+            "message": f"✅ Cookies uploaded successfully for {platform}",
+            "client_id": client_id,
+            "cookie_count": len(cookies_data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
 # 2️⃣ Scrape Platform Data

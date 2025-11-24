@@ -1,7 +1,5 @@
-
-
 # services/db_service.py
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from uuid import uuid4
 from pydantic import BaseModel
@@ -20,6 +18,10 @@ class ClientRegistration(BaseModel):
     preferred_profession: str
     preferred_location: str
 
+
+# ============================================================
+# CLIENT REGISTRATION
+# ============================================================
 
 def register_client(data: dict) -> str:
     """Register new client and return UUID"""
@@ -66,6 +68,63 @@ def update_client_generated_message(client_id: str, message_data: Dict):
 
 
 # ============================================================
+# 🍪 COOKIE STORAGE + EXPIRY CHECK (ADDED)
+# ============================================================
+
+def save_client_cookies(client_id: str, platform: str, cookies_data: List[Dict], expires_in_days: int = 30):
+    """
+    Save or update cookies for a platform inside clients_collection.
+    """
+    expires_at = datetime.utcnow() + timedelta(days=expires_in_days)
+
+    update_data = {
+        f"cookies.{platform}": {
+            "data": cookies_data,
+            "expires_at": expires_at.isoformat(),
+            "is_active": True,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+    }
+
+    clients_collection.update_one(
+        {"client_id": client_id},
+        {"$set": update_data},
+        upsert=True
+    )
+    print(f"🍪 Saved cookies for {platform} | {client_id}")
+
+
+def get_cookie_status(client_id: str, platform: str):
+    """
+    Check cookie expiry & status from clients_collection.
+    """
+    client = clients_collection.find_one(
+        {"client_id": client_id},
+        {"cookies": 1, "_id": 0}
+    )
+
+    if not client or "cookies" not in client:
+        return None
+    
+    platform_data = client["cookies"].get(platform)
+    if not platform_data:
+        return None
+    
+    expires_at = platform_data.get("expires_at")
+    if not expires_at:
+        return None
+
+    is_expired = datetime.utcnow() > datetime.fromisoformat(expires_at)
+
+    return {
+        "platform": platform,
+        "expires_at": expires_at,
+        "is_expired": is_expired,
+        "is_active": not is_expired
+    }
+
+
+# ============================================================
 # COMPATIBILITY LAYER FOR SCRAPING SERVICE
 # ============================================================
 
@@ -87,7 +146,6 @@ def save_scraped_data(client_id: str, platform: str, profiles: List[Dict]) -> in
         profile["platform"] = platform
         profile["fetched_at"] = datetime.utcnow()
         
-        # Generate unique key
         unique_key = (
             profile.get("linkedinUrl")
             or profile.get("profileUrl")
@@ -98,7 +156,6 @@ def save_scraped_data(client_id: str, platform: str, profiles: List[Dict]) -> in
         )
         profile["unique_key"] = unique_key
         
-        # Mark if profile has content
         profile["has_valid_content"] = bool(
             profile.get("bio") or 
             profile.get("summary") or
@@ -109,7 +166,6 @@ def save_scraped_data(client_id: str, platform: str, profiles: List[Dict]) -> in
             profile.get("fullName")
         )
 
-        # Upsert to avoid duplicates
         audience_collection.update_one(
             {
                 "client_id": client_id,
@@ -121,7 +177,6 @@ def save_scraped_data(client_id: str, platform: str, profiles: List[Dict]) -> in
         )
         saved_count += 1
 
-    # Update client fetch stats
     update_client_status(client_id, {
         "status": "data_fetched" if saved_count else "data_fetch_attempted",
         "data_fetched_at": datetime.utcnow(),
@@ -133,19 +188,13 @@ def save_scraped_data(client_id: str, platform: str, profiles: List[Dict]) -> in
 
 
 def get_scraped_posts(client_id: str, platform: str) -> List[Dict]:
-    """
-    Retrieve scraped profiles - COMPATIBILITY WRAPPER
-    Returns profiles from audience collection
-    """
     cursor = audience_collection.find({
         "client_id": client_id,
         "platform": platform,
-        "unique_key": {"$exists": True}  # Only get scraped profiles
+        "unique_key": {"$exists": True}
     })
     
     posts = list(cursor)
-    
-    # Remove MongoDB _id
     for post in posts:
         post.pop("_id", None)
     
@@ -154,15 +203,10 @@ def get_scraped_posts(client_id: str, platform: str) -> List[Dict]:
 
 
 def save_prospects(client_id: str, platform: str, prospects: List[Dict]):
-    """
-    Save extracted prospects - COMPATIBILITY WRAPPER
-    Stores prospects in the same collection with a special marker
-    """
     if not prospects:
         print("⚠️  No prospects to save")
         return
     
-    # Create a prospects document
     prospects_doc = {
         "client_id": client_id,
         "platform": platform,
@@ -171,7 +215,6 @@ def save_prospects(client_id: str, platform: str, prospects: List[Dict]):
         "prospects": []
     }
     
-    # Check if prospects doc already exists
     existing = audience_collection.find_one({
         "client_id": client_id,
         "platform": platform,
@@ -179,14 +222,13 @@ def save_prospects(client_id: str, platform: str, prospects: List[Dict]):
     })
     
     if existing:
-        # Update existing
         existing_prospects = existing.get("prospects", [])
         existing_usernames = {p.get("username") for p in existing_prospects}
         
-        new_prospects = []
-        for prospect in prospects:
-            if prospect.get("username") not in existing_usernames:
-                new_prospects.append(prospect)
+        new_prospects = [
+            prospect for prospect in prospects
+            if prospect.get("username") not in existing_usernames
+        ]
         
         if new_prospects:
             audience_collection.update_one(
@@ -199,20 +241,16 @@ def save_prospects(client_id: str, platform: str, prospects: List[Dict]):
             )
             print(f"💾 Added {len(new_prospects)} new prospects for client {client_id}")
     else:
-        # Create new prospects document
         prospects_doc["prospects"] = prospects
         audience_collection.insert_one(prospects_doc)
         print(f"💾 Saved {len(prospects)} prospects for client {client_id}")
 
 
-# ========================================
-# ORIGINAL PROSPECT MANAGEMENT FUNCTIONS
-# ========================================
+# ============================================================
+# PROSPECT MANAGEMENT
+# ============================================================
 
 def get_prospects_from_audience(client_id: str, platform: str = None) -> Dict:
-    """
-    Get prospects for a specific client from audience collection
-    """
     query = {
         "client_id": client_id,
         "type": "prospects"
@@ -243,9 +281,7 @@ def get_prospects_from_audience(client_id: str, platform: str = None) -> Dict:
 
 def update_prospect_status(client_id: str, platform: str, username: str, 
                           status: str, contacted_date: str = None) -> bool:
-    """
-    Update the status of a specific prospect
-    """
+
     update_data = {
         "prospects.$.status": status,
         "prospects.$.last_contacted": contacted_date or datetime.utcnow().isoformat()
@@ -270,13 +306,9 @@ def update_prospect_status(client_id: str, platform: str, username: str,
 
 
 def get_prospects_by_status(client_id: str, platform: str, status: str = "new") -> List[Dict]:
-    """
-    Get prospects filtered by status (new, contacted, replied, etc.)
-    """
     prospects_data = get_prospects_from_audience(client_id, platform)
     prospects = prospects_data.get('prospects', [])
     
-    # Filter by status
     filtered = [p for p in prospects if p.get('status') == status]
     
     print(f"🎯 Found {len(filtered)} {status} prospects for {client_id}")
@@ -284,15 +316,11 @@ def get_prospects_by_status(client_id: str, platform: str, status: str = "new") 
 
 
 def get_all_prospects(client_id: str, platform: str) -> List[Dict]:
-    """
-    Get all prospects for a client regardless of status
-    """
     prospects_data = get_prospects_from_audience(client_id, platform)
     return prospects_data.get('prospects', [])
 
 
 def count_prospects(client_id: str, platform: str) -> int:
-    """Count audience profiles for client"""
     return audience_collection.count_documents({
         "client_id": client_id,
         "platform": platform
@@ -300,7 +328,6 @@ def count_prospects(client_id: str, platform: str) -> int:
 
 
 def get_prospect_profiles(client_id: str, platform: str, limit: int = 10) -> List[Dict]:
-    """Get top prospect profiles sorted by location relevance"""
     return list(
         audience_collection.find(
             {
@@ -316,9 +343,6 @@ def get_prospect_profiles(client_id: str, platform: str, limit: int = 10) -> Lis
 
 
 def get_prospects_statistics(client_id: str, platform: str) -> Dict:
-    """
-    Get statistics about prospects for a client
-    """
     prospects_data = get_prospects_from_audience(client_id, platform)
     prospects = prospects_data.get('prospects', [])
     
@@ -336,7 +360,6 @@ def get_prospects_statistics(client_id: str, platform: str) -> Dict:
 
 
 def get_client_stats(client_id: str) -> Dict:
-    """Get overall client statistics"""
     client = get_client_data(client_id)
     if not client:
         return {}

@@ -3,6 +3,7 @@ import json
 import re
 from apify_client import ApifyClient
 from pymongo import MongoClient
+from datetime import datetime
 
 # MongoDB Connection
 mongo_uri = os.getenv("MONGO_URI")
@@ -11,6 +12,7 @@ if not mongo_uri:
 
 mongo_client = MongoClient(mongo_uri)
 db = mongo_client["cosmetics_app"]
+clients_collection = db["clients"]
 audience_collection = db["audience_data"]
 
 
@@ -47,12 +49,66 @@ def sanitize_message(text: str) -> str:
     return clean_text.strip()
 
 
+def get_instagram_cookies_from_db(client_id: str):
+    """
+    Fetch Instagram cookies from MongoDB for the given client_id.
+    Validates expiry and returns cookie data.
+    """
+    client = clients_collection.find_one(
+        {"client_id": client_id},
+        {"cookies": 1, "_id": 0}
+    )
+    
+    if not client:
+        raise ValueError(f"❌ Client {client_id} not found in database")
+    
+    if "cookies" not in client:
+        raise ValueError(f"❌ No cookies found for client {client_id}")
+    
+    instagram_cookies = client["cookies"].get("instagram")
+    
+    if not instagram_cookies:
+        raise ValueError(
+            f"❌ No Instagram cookies found for client {client_id}\n"
+            "👉 Upload cookies via: POST /pipeline/cookies-file/{client_id}"
+        )
+    
+    # Check if cookies are expired
+    expires_at = instagram_cookies.get("expires_at")
+    if expires_at:
+        expiry_date = datetime.fromisoformat(expires_at)
+        if datetime.utcnow() > expiry_date:
+            raise ValueError(
+                f"❌ Instagram cookies expired on {expires_at}\n"
+                "👉 Please re-upload cookies via: POST /pipeline/cookies-file/{client_id}"
+            )
+    
+    # Check if cookies are marked as inactive
+    if not instagram_cookies.get("is_active", True):
+        raise ValueError(
+            f"❌ Instagram cookies are marked as inactive\n"
+            "👉 Please re-upload cookies via: POST /pipeline/cookies-file/{client_id}"
+        )
+    
+    cookies_data = instagram_cookies.get("data")
+    
+    if not cookies_data:
+        raise ValueError(f"❌ Cookie data is empty for client {client_id}")
+    
+    print(f"✅ Loaded {len(cookies_data)} Instagram cookies from database")
+    return cookies_data
+
+
 def send_instagram_dm(recipient_username: str, message: str, client_id: str = None):
     """
     Send Instagram DM using bhansalisoft/instagram-bulk-message-sender
+    Fetches cookies from MongoDB instead of local file.
     """
     if not recipient_username:
         raise ValueError("Recipient username is missing")
+    
+    if not client_id:
+        raise ValueError("❌ client_id is required to fetch cookies from database")
 
     print(f"\n📤 Sending Instagram DM to @{recipient_username}")
 
@@ -66,13 +122,11 @@ def send_instagram_dm(recipient_username: str, message: str, client_id: str = No
 
     client = ApifyClient(apify_token)
 
-    # Load cookies
-    cookies_path = os.getenv("INSTAGRAM_COOKIES_PATH", "cookies.json")
-    if not os.path.exists(cookies_path):
-        raise FileNotFoundError(f"Instagram cookies file not found: {cookies_path}")
-
-    with open(cookies_path, "r", encoding="utf-8") as f:
-        cookies_data = json.load(f)
+    # ✅ Fetch cookies from MongoDB
+    try:
+        cookies_data = get_instagram_cookies_from_db(client_id)
+    except Exception as e:
+        raise ValueError(f"Failed to load cookies: {str(e)}")
 
     # Actor input
     run_input = {
