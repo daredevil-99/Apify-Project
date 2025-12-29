@@ -166,17 +166,80 @@ def extract_prospect_info(post: Dict, platform: str) -> Dict:
             "current_positions": current_positions
         })
 
-    elif platform == "facebook":
+    if platform == "facebook":
+        # Extract core identifiers
+        page_id = post.get("pageId") or post.get("facebookId")
+        page_name = post.get("pageName", "")
+        page_url = post.get("pageUrl") or post.get("facebookUrl", "")
+        
+        # Page details
+        title = post.get("title", "")
+        categories = post.get("categories", [])
+        category = categories[0] if categories else "Business"
+        
+        # Description/About
+        info_array = post.get("info", [])
+        description = " ".join(info_array) if info_array else ""
+        
+        about_me = post.get("about_me", {})
+        about_text = ""
+        if isinstance(about_me, dict):
+            about_text = about_me.get("text", "")
+        
+        # Contact info
+        email = post.get("email", "")
+        phone = post.get("phone", "")
+        website = post.get("website", "")
+        address = post.get("address", "")
+        
+        # Engagement metrics
+        likes = post.get("likes", 0)
+        followers = post.get("followers", 0)
+        rating_overall = post.get("ratingOverall")
+        rating_count = post.get("ratingCount", 0)
+        
         prospect.update({
-            "username": post.get("name"),
-            "profile_url": post.get("url"),
-            "category": post.get("category"),
-            "location": post.get("location"),
-            "rating": post.get("rating"),
-            "reviews": post.get("reviewsCount")
+            # Core identifiers
+            "username": page_name,
+            "page_id": page_id,
+            "name": title or page_name,
+            "profile_url": page_url,
+            
+            # Page details
+            "type": "page",
+            "category": category,
+            "categories": categories,
+            "description": description,
+            "about": about_text,
+            
+            # Contact info
+            "email": email,
+            "phone": phone,
+            "website": website,
+            "location": address,
+            
+            # Metrics
+            "likes": likes,
+            "followers": followers,
+            "rating": rating_overall,
+            "rating_count": rating_count,
+            
+            # Status
+            "enriched": False,
+            "source": "facebook_search_scraper",
+            "scraped_at": datetime.utcnow().isoformat(),
+            
+            # Additional
+            "creation_date": post.get("creation_date"),
+            "ad_status": post.get("ad_status"),
+            "price_range": post.get("priceRange"),
+            "messenger": post.get("messenger"),
         })
 
-    # Only return if we have essential info
+    # Remove empty values
+    prospect = {k: v for k, v in prospect.items() if v not in [None, "", [], {}]}
+
+    # Validate
     if prospect.get("username") and prospect.get("profile_url"):
         return prospect
     

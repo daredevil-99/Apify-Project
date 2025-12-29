@@ -246,6 +246,66 @@ def save_prospects(client_id: str, platform: str, prospects: List[Dict]):
         print(f"💾 Saved {len(prospects)} prospects for client {client_id}")
 
 
+def update_prospect_with_enrichment(
+    client_id: str, 
+    platform: str, 
+    prospect_index: int, 
+    enriched_data: dict
+) -> bool:
+    """
+    Update a specific prospect with enriched profile data (posts, engagement, etc.)
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Extract relevant fields from enriched data
+        update_fields = {
+            f"prospects.{prospect_index}.enriched": True,
+            f"prospects.{prospect_index}.enriched_at": datetime.utcnow().isoformat()
+        }
+        
+        # Add optional fields only if they exist
+        if enriched_data.get("posts"):
+            update_fields[f"prospects.{prospect_index}.posts"] = enriched_data["posts"]
+        
+        if enriched_data.get("engagement"):
+            update_fields[f"prospects.{prospect_index}.engagement"] = enriched_data["engagement"]
+        
+        if enriched_data.get("experience"):
+            update_fields[f"prospects.{prospect_index}.experience"] = enriched_data["experience"]
+        
+        if enriched_data.get("skills"):
+            update_fields[f"prospects.{prospect_index}.skills"] = enriched_data["skills"]
+        
+        if enriched_data.get("about"):
+            update_fields[f"prospects.{prospect_index}.about"] = enriched_data["about"]
+        
+        # Additional fields that might come from enrichment
+        for field in ["headline", "summary", "firstName", "lastName", "location"]:
+            if enriched_data.get(field):
+                update_fields[f"prospects.{prospect_index}.{field}"] = enriched_data[field]
+        
+        result = audience_collection.update_one(
+            {
+                "client_id": client_id,
+                "platform": platform,
+                "type": "prospects"
+            },
+            {"$set": update_fields}
+        )
+        
+        if result.modified_count > 0:
+            print(f"✅ Saved enriched data for prospect at index {prospect_index}")
+            return True
+        else:
+            print(f"⚠️ No document modified for prospect at index {prospect_index}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error saving enriched data: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 # ============================================================
 # PROSPECT MANAGEMENT
 # ============================================================
