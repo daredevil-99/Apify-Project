@@ -22,389 +22,220 @@ def clean_hashtag(tag: str) -> str:
     return cleaned.lower()
 
 
-def calculate_location_relevance(profile: Dict, preferred_location: str) -> int:
-    """Calculate location relevance score (0-10)"""
-    if not preferred_location:
-        return 5
-
-    location_lower = preferred_location.lower()
-    score = 0
-
-    # Check caption (most likely to have location info)
-    caption = profile.get('caption', '').lower()
-    if location_lower in caption:
-        score += 5
-    
-    # Check hashtags (very important for Instagram)
-    hashtags = profile.get('hashtags', [])
-    for tag in hashtags:
-        if location_lower in tag.lower():
-            score += 3
-            break
-    
-    # Check alt text
-    alt = profile.get('alt', '').lower()
-    if location_lower in alt:
-        score += 2
-    
-    # Check location tag if available
-    location_name = profile.get('locationName', '').lower()
-    if location_lower in location_name:
-        score += 5
-    
-    # Check owner username (sometimes has location)
-    owner_username = profile.get('ownerUsername', '').lower()
-    if location_lower in owner_username:
-        score += 3
-
-    # If score is 0 but profile uses location-based hashtag, give minimum score
-    if score == 0:
-        for tag in hashtags:
-            if any(loc_word in tag.lower() for loc_word in ['chennai', 'india', 'tamil']):
-                score += 1
-                break
-
-    return min(score, 10)
-
-
-def filter_profiles_by_location(profiles: List[Dict], preferred_location: str, min_score: int = 2) -> List[Dict]:
-    """Filter and sort profiles by location relevance"""
-    if not preferred_location:
-        return profiles
-
-    scored_profiles = []
-    for profile in profiles:
-        score = calculate_location_relevance(profile, preferred_location)
-        profile['location_relevance_score'] = score
-        if score >= min_score:
-            scored_profiles.append(profile)
-
-    scored_profiles.sort(key=lambda x: x.get('location_relevance_score', 0), reverse=True)
-    return scored_profiles
-
-def calculate_profile_relevance(profile: Dict, profession: str, location: str, search_terms: List[str]) -> Dict:
+def get_popular_hashtags(profession: str, location: str = None) -> List[str]:
     """
-    Calculate comprehensive relevance score for an Instagram profile.
-    
-    Returns:
-        {
-            "total_score": int (0-100),
-            "profession_score": int (0-40),
-            "location_score": int (0-30),
-            "keyword_score": int (0-30),
-            "is_relevant": bool
-        }
+    Get popular Instagram hashtags for a profession.
+    Returns hashtags that are actually used on Instagram (verified manually).
     """
-    scores = {
-        "profession_score": 0,
-        "location_score": 0,
-        "keyword_score": 0,
-        "total_score": 0,
-        "is_relevant": False
+    profession_lower = profession.lower() if profession else ""
+    
+    # Popular hashtag mapping (these are real hashtags with good engagement)
+    hashtag_map = {
+        'makeupartist': ['makeup', 'mua', 'makeupartist', 'makeuplover', 'bridalmakeup'],
+        'makeup': ['makeup', 'mua', 'makeupartist', 'makeuplover', 'bridalmakeup'],
+        'photographer': ['photography', 'photographer', 'photo', 'photoshoot', 'portraits'],
+        'photography': ['photography', 'photographer', 'photo', 'photoshoot', 'portraits'],
+        'weddingphotographer': ['weddingphotography', 'weddingphotographer', 'bride', 'wedding'],
+        'weddingphotography': ['weddingphotography', 'weddingphotographer', 'bride', 'wedding'],
+        'baker': ['baking', 'baker', 'cakes', 'homebaker', 'dessert'],
+        'chef': ['chef', 'food', 'cooking', 'foodie', 'instafood'],
+        'designer': ['design', 'designer', 'graphicdesign', 'creative'],
+        'fitness': ['fitness', 'gym', 'workout', 'fitnessmotivation', 'trainer'],
     }
     
-    # Get searchable text from profile
-    username = profile.get('username', '').lower()
-    full_name = profile.get('full_name', '').lower()
-    bio = profile.get('bio', '').lower()
+    # Find matching hashtags
+    hashtags = []
+    for key, tags in hashtag_map.items():
+        if key in profession_lower:
+            hashtags = tags.copy()
+            break
     
-    # For post-based profiles, also check sample post
-    sample_post = profile.get('sample_post', {})
-    caption = sample_post.get('caption', '').lower() if sample_post else ''
-    hashtags = sample_post.get('hashtags', []) if sample_post else []
-    hashtags_text = ' '.join([str(h).lower() for h in hashtags])
+    # If no match, use the profession itself
+    if not hashtags:
+        hashtags = [profession_lower]
     
-    # Combine all searchable text
-    searchable_text = f"{username} {full_name} {bio} {caption} {hashtags_text}"
-    
-    # ==========================================
-    # 1️⃣ PROFESSION RELEVANCE (Max: 40 points)
-    # ==========================================
-    if profession:
-        prof_lower = profession.lower()
-        prof_keywords = [prof_lower]
-        
-        # Add related terms for common professions
-        profession_variants = {
-            'baker': ['baking', 'bakery', 'bakes', 'pastry', 'cake', 'bread'],
-            'designer': ['design', 'designs', 'designing', 'creative'],
-            'developer': ['dev', 'coding', 'programmer', 'software', 'engineer'],
-            'photographer': ['photo', 'photography', 'photos', 'camera'],
-            'chef': ['cooking', 'cook', 'culinary', 'food', 'kitchen'],
-            'artist': ['art', 'painting', 'drawing', 'illustration'],
-            'fitness': ['gym', 'workout', 'training', 'coach', 'trainer'],
-        }
-        
-        # Get variants for this profession
-        for key, variants in profession_variants.items():
-            if key in prof_lower:
-                prof_keywords.extend(variants)
-                break
-        
-        # Score based on profession mentions
-        profession_mentions = 0
-        for keyword in prof_keywords:
-            if keyword in username:
-                scores['profession_score'] += 15  # Username is strong signal
-                profession_mentions += 1
-            if keyword in bio:
-                scores['profession_score'] += 10  # Bio is good signal
-                profession_mentions += 1
-            if keyword in full_name:
-                scores['profession_score'] += 8
-                profession_mentions += 1
-            if keyword in caption:
-                scores['profession_score'] += 3
-                profession_mentions += 1
-            if keyword in hashtags_text:
-                scores['profession_score'] += 2
-                profession_mentions += 1
-        
-        # Cap profession score at 40
-        scores['profession_score'] = min(scores['profession_score'], 40)
-    
-    # ==========================================
-    # 2️⃣ LOCATION RELEVANCE (Max: 30 points)
-    # ==========================================
+    # Add location-specific versions if location provided
     if location:
-        loc_lower = location.lower()
-        location_keywords = [loc_lower]
+        loc_clean = clean_hashtag(location)
+        location_hashtags = []
         
-        # Add related location terms
-        location_variants = {
-            'chennai': ['chennai', 'madras', 'tamilnadu', 'tamil nadu', 'tn'],
-            'mumbai': ['mumbai', 'bombay', 'maharashtra'],
-            'delhi': ['delhi', 'newdelhi', 'new delhi', 'ncr'],
-            'bangalore': ['bangalore', 'bengaluru', 'blr', 'karnataka'],
-        }
+        # Add location to each hashtag
+        for tag in hashtags[:3]:  # Only add location to top 3 hashtags
+            location_hashtags.append(f"{tag}{loc_clean}")
         
-        for key, variants in location_variants.items():
-            if key in loc_lower:
-                location_keywords.extend(variants)
-                break
+        # Also add standalone location
+        location_hashtags.append(loc_clean)
         
-        # Score based on location mentions
-        for keyword in location_keywords:
-            if keyword in username:
-                scores['location_score'] += 12
-            if keyword in bio:
-                scores['location_score'] += 8
-            if keyword in caption:
-                scores['location_score'] += 4
-            if keyword in hashtags_text:
-                scores['location_score'] += 3
-        
-        # Cap location score at 30
-        scores['location_score'] = min(scores['location_score'], 30)
+        # Combine: location-specific first, then general
+        hashtags = location_hashtags + hashtags
     
-    # ==========================================
-    # 3️⃣ SEARCH TERM RELEVANCE (Max: 30 points)
-    # ==========================================
-    if search_terms:
-        for term in search_terms:
-            term_lower = str(term).lower()
-            if len(term_lower) < 3:
-                continue
-            
-            if term_lower in username:
-                scores['keyword_score'] += 10
-            if term_lower in bio:
-                scores['keyword_score'] += 6
-            if term_lower in full_name:
-                scores['keyword_score'] += 5
-            if term_lower in caption:
-                scores['keyword_score'] += 2
-            if term_lower in hashtags_text:
-                scores['keyword_score'] += 1
-        
-        # Cap keyword score at 30
-        scores['keyword_score'] = min(scores['keyword_score'], 30)
-    
-    # ==========================================
-    # 4️⃣ SPAM/IRRELEVANT DETECTION (Penalties)
-    # ==========================================
-    spam_indicators = [
-        'vc_', '_vc', 'girl', 'girls', 'aunty', 'dating', 'call', 'whatsapp',
-        'tamil_', '_tamil', 'hot', 'sexy', 'adult', 'xxx', 'porn'
-    ]
-    
-    spam_penalty = 0
-    for indicator in spam_indicators:
-        if indicator in username:
-            spam_penalty += 20  # Heavy penalty for spam in username
-        if indicator in bio:
-            spam_penalty += 10
-    
-    # ==========================================
-    # FINAL SCORE CALCULATION
-    # ==========================================
-    scores['total_score'] = (
-        scores['profession_score'] + 
-        scores['location_score'] + 
-        scores['keyword_score'] - 
-        spam_penalty
-    )
-    
-    # Ensure score doesn't go negative
-    scores['total_score'] = max(scores['total_score'], 0)
-    
-    # Determine if profile is relevant
-    # Minimum thresholds:
-    # - Total score >= 25 (out of 100)
-    # - At least some profession match (>= 10) OR some location match (>= 10)
-    scores['is_relevant'] = (
-        scores['total_score'] >= 25 and
-        (scores['profession_score'] >= 10 or scores['location_score'] >= 10)
-    )
-    
-    return scores
+    return hashtags[:8]  # Limit to 8 hashtags
 
 
 def scrape_instagram(search_terms: List[str], profession: str = None, location: str = None) -> List[Dict]:
     """
-    Scrape Instagram profiles via Apify with SMART RELEVANCE FILTERING.
+    Simple Instagram scraper - fetch profiles for given hashtags.
     
-    Now properly filters out irrelevant profiles based on:
-    - Profession relevance
-    - Location relevance  
-    - Search term matches
-    - Spam detection
+    Args:
+        search_terms: List of hashtags to search
+                     - If empty/generic, will auto-generate from profession
+        profession: Profession to search (used for hashtag suggestions)
+        location: Location to add to hashtags
+    
+    Returns:
+        List of Instagram profiles from posts matching the hashtags
     """
     try:
-        # Build hashtags with location
-        hashtags = [clean_hashtag(t) for t in search_terms if clean_hashtag(t)]
-
-        if profession:
-            hashtags.append(clean_hashtag(profession))
-
-        if location:
-            location_clean = clean_hashtag(location)
-            hashtags.extend([
-                location_clean,
-                f"{location_clean}{clean_hashtag(profession)}" if profession else None,
-            ])
-
-        hashtags = list({h for h in hashtags if h})[:10]
-
-        print(f"\n📸 Instagram Search Parameters:")
+        # Clean and prepare hashtags from search terms
+        hashtags = []
+        for term in search_terms:
+            cleaned = clean_hashtag(term)
+            if cleaned and len(cleaned) >= 2:
+                hashtags.append(cleaned)
+        
+        # If no valid hashtags or only generic ones, use profession-based suggestions
+        if not hashtags or (len(hashtags) <= 2 and profession):
+            print(f"⚠️ Using profession-based hashtag suggestions...")
+            suggested = get_popular_hashtags(profession, location)
+            print(f"💡 Suggested hashtags: {suggested}")
+            
+            # Merge with existing, prefer suggested ones
+            hashtags = suggested + [h for h in hashtags if h not in suggested]
+        
+        # Add location-based hashtags if location is provided and not already added
+        elif location:
+            loc_clean = clean_hashtag(location)
+            
+            # Add standalone location hashtag
+            if loc_clean not in hashtags:
+                hashtags.append(loc_clean)
+            
+            # Add profession+location combo if profession exists
+            if profession:
+                prof_clean = clean_hashtag(profession)
+                combined = f"{prof_clean}{loc_clean}"
+                if combined not in hashtags:
+                    hashtags.insert(0, combined)  # Add at beginning (highest priority)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        hashtags = [x for x in hashtags if not (x in seen or seen.add(x))]
+        
+        # Limit to 8 hashtags max
+        hashtags = hashtags[:8]
+        
+        if not hashtags:
+            print("⚠️ No valid hashtags provided")
+            return []
+        
+        print(f"\n📸 Instagram Search:")
         print(f"   Hashtags: {hashtags}")
-        print(f"   Profession: {profession}")
-        print(f"   Location: {location}")
-
+        if location:
+            print(f"   Location Focus: {location}")
+        if profession:
+            print(f"   Profession: {profession}")
+        
+        # Call Apify - exact same as UI
         actor_id = "apify/instagram-hashtag-scraper"
         payload = {
             "hashtags": hashtags,
-            "resultsLimit": 100,  # Get more to filter from
+            "resultsType": "posts",
+            "resultsLimit": 20,
             "addParentData": False
         }
-
+        
+        print(f"🔍 Calling Apify Actor with payload: {payload}")
+        
         run = apify_client.actor(actor_id).call(run_input=payload)
         
         if not run or "defaultDatasetId" not in run:
             print("⚠️ Instagram actor returned no dataset")
             return []
-
-        items = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
-        print(f"\n✅ Retrieved {len(items)} Instagram posts")
+        
+        dataset_id = run["defaultDatasetId"]
+        items = list(apify_client.dataset(dataset_id).iterate_items())
+        
+        print(f"✅ Retrieved {len(items)} posts from Apify")
+        print(f"💾 Dataset: https://console.apify.com/storage/datasets/{dataset_id}")
+        
+        if not items:
+            print("⚠️ No posts found for these hashtags!")
+            print("💡 Suggestions:")
+            print("   - Try more popular hashtags (check Instagram to see post counts)")
+            print("   - Use broader terms like 'makeup' instead of 'makeupartist'")
+            print("   - Check Apify dataset URL above to see what was returned")
+            return []
+        
+        # Show sample of what we got
+        print(f"\n📋 Sample posts retrieved:")
+        for i, item in enumerate(items[:3], 1):
+            username = item.get('ownerUsername', 'unknown')
+            caption = item.get('caption', '')[:60]
+            hashtags_sample = item.get('hashtags', [])[:3]
+            print(f"   {i}. @{username}")
+            print(f"      Caption: {caption}...")
+            print(f"      Hashtags: {hashtags_sample}")
         
         # Extract unique profiles from posts
         profiles_map = {}
         
         for post in items:
             username = post.get('ownerUsername')
-            
             if not username:
                 continue
             
-            # Skip if we already have this profile
+            # If we already have this profile, just increment post count
             if username in profiles_map:
-                continue
-            
-            # Build profile object from post data
-            profile = {
-                "profile_url": f"https://instagram.com/{username}",
-                "username": username,
-                "full_name": post.get('ownerFullName', ''),
-                "profile_pic_url": post.get('ownerProfilePicUrl', ''),
-                
-                # Will be filled by enrichment
-                "followers": 0,
-                "following": 0,
-                "posts": 0,
-                "bio": "",
-                "verified": False,
-                "private": False,
-                
-                # Keep sample post for relevance scoring
-                "sample_post": {
-                    "caption": post.get('caption', ''),
-                    "likes": post.get('likesCount', 0),
-                    "comments": post.get('commentsCount', 0),
-                    "hashtags": post.get('hashtags', []),
-                    "post_url": post.get('url', '')
+                profiles_map[username]['post_count'] += 1
+                profiles_map[username]['total_likes'] += post.get('likesCount', 0)
+            else:
+                # Create new profile entry
+                profiles_map[username] = {
+                    "profile_url": f"https://instagram.com/{username}",
+                    "username": username,
+                    "full_name": post.get('ownerFullName', ''),
+                    "profile_pic_url": post.get('ownerProfilePicUrl', ''),
+                    "verified": post.get('ownerIsVerified', False),
+                    "bio": "",  # Empty until profile enrichment
+                    "followers": 0,
+                    "following": 0,
+                    "posts": 0,
+                    "private": False,
+                    
+                    # Metadata for sorting
+                    "post_count": 1,
+                    "total_likes": post.get('likesCount', 0),
                 }
-            }
-            
-            profiles_map[username] = profile
         
         profiles = list(profiles_map.values())
-        print(f"✅ Extracted {len(profiles)} unique profiles from posts")
         
-        # ⭐ APPLY SMART RELEVANCE FILTERING
-        print(f"\n🎯 Applying relevance filtering...")
-        print(f"   Profession filter: {profession}")
-        print(f"   Location filter: {location}")
-        print(f"   Search terms: {search_terms}")
+        print(f"✅ Found {len(profiles)} unique profiles")
         
-        scored_profiles = []
-        for profile in profiles:
-            scores = calculate_profile_relevance(
-                profile=profile,
-                profession=profession,
-                location=location,
-                search_terms=search_terms
-            )
-            
-            profile['relevance_scores'] = scores
-            profile['total_relevance_score'] = scores['total_score']
-            profile['is_relevant'] = scores['is_relevant']
-            
-            # Only keep relevant profiles
-            if scores['is_relevant']:
-                scored_profiles.append(profile)
+        # Sort by engagement (profiles with more matching posts first)
+        profiles.sort(key=lambda x: (
+            x.get('post_count', 0) * 1000 +  # More posts = more relevant
+            x.get('total_likes', 0)           # More likes = higher quality
+        ), reverse=True)
         
-        print(f"\n📊 Filtering Results:")
-        print(f"   Total profiles found: {len(profiles)}")
-        print(f"   Relevant profiles: {len(scored_profiles)}")
-        print(f"   Filtered out: {len(profiles) - len(scored_profiles)}")
+        # Return top 20 profiles
+        result_profiles = profiles[:20]
         
-        # Sort by relevance score (highest first)
-        scored_profiles.sort(key=lambda x: x.get('total_relevance_score', 0), reverse=True)
-        
-        # Show top profiles with scores
-        if scored_profiles:
-            print(f"\n🏆 Top 5 Most Relevant Profiles:")
-            for i, profile in enumerate(scored_profiles[:5], 1):
-                scores = profile['relevance_scores']
-                print(f"\n   {i}. @{profile['username']}")
-                print(f"      Total Score: {scores['total_score']}/100")
-                print(f"      - Profession: {scores['profession_score']}/40")
-                print(f"      - Location: {scores['location_score']}/30")
-                print(f"      - Keywords: {scores['keyword_score']}/30")
-        else:
-            print(f"\n⚠️  No relevant profiles found!")
-            print(f"💡 Try broader search terms or different hashtags")
-        
-        # Return top 20 relevant profiles
-        result_profiles = scored_profiles[:20]
+        print(f"\n🏆 Returning {len(result_profiles)} profiles")
+        if result_profiles:
+            print("\nTop 5 Profiles:")
+            for i, profile in enumerate(result_profiles[:5], 1):
+                verified = "✓" if profile.get('verified') else " "
+                print(f"   {i}. {verified} @{profile['username']}")
+                print(f"      Found in {profile['post_count']} posts, {profile['total_likes']} total likes")
         
         return result_profiles
-
+    
     except Exception as e:
         print(f"❌ Instagram scraping error: {e}")
         import traceback
         traceback.print_exc()
         return []
+
 
 
 def enrich_instagram_profiles(profile_urls: List[str]) -> Dict[str, Dict]:
@@ -603,6 +434,7 @@ def enrich_instagram_profiles(profile_urls: List[str]) -> Dict[str, Dict]:
         import traceback
         traceback.print_exc()
         return {}
+
 
 def scrape_linkedin(search_terms: List[str], profession: str = None, location: str = None) -> List[Dict]:
     """

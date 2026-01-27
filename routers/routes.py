@@ -6,6 +6,7 @@ from fastapi import (
     APIRouter, BackgroundTasks, HTTPException, Body, 
     UploadFile, File, Query, Request
 )
+import httpx
 from pydantic import BaseModel, field_validator
 from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
@@ -57,7 +58,7 @@ import requests
 
 # ------------------- CONFIGURATION ----------------------
 UNIPILE_API_TOKEN = os.getenv("UNIPILE_API_TOKEN")
-UNIPILE_DSN = os.getenv("UNIPILE_DSN", "https://api.unipile.com:13410")
+UNIPILE_DSN = os.getenv("UNIPILE_DSN")
 
 # Ensure UNIPILE_DSN has https:// prefix
 if UNIPILE_DSN and not UNIPILE_DSN.startswith(('http://', 'https://')):
@@ -3530,25 +3531,34 @@ async def send_facebook_messages(request: SendMessagesRequest):
 # INSTAGRAM DM ENDPOINTS - ADD TO routes.py
 # ============================================================
 
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse, HTMLResponse
+import requests
+import httpx
+import json
+from datetime import datetime, timedelta
+import logging
+
+from db_config import clients_collection
+
+
+APP_BASE_URL = os.getenv("APP_BASE_URL")
+
+def get_client_data(client_id: str):
+    """Helper to get client from MongoDB"""
+    return clients_collection.find_one({"client_id": client_id})
+
+
 @router.get("/connect-instagram/{client_id}")
 async def initiate_instagram_connection(client_id: str, redirect: bool = Query(True)):
     """
     Step 1: Generate Unipile Hosted Auth Link for Instagram
-    
-    By default (redirect=true): Returns 302 redirect to Unipile OAuth page
-    With redirect=false: Returns JSON with the auth URL
-    
-    Examples:
-    - GET /connect-instagram/{client_id}  → Auto-redirects to Unipile
-    - GET /connect-instagram/{client_id}?redirect=false  → Returns JSON with URL
     """
     try:
         # Verify client exists
         client = get_client_data(client_id)
         if not client:
             raise HTTPException(404, "Client not found")
-        
-        from datetime import datetime, timedelta
         
         # Generate hosted auth link via Unipile API
         headers = {
@@ -3570,13 +3580,12 @@ async def initiate_instagram_connection(client_id: str, redirect: bool = Query(T
             "providers": ["INSTAGRAM"],
             "expiresOn": expires_on,
             "notify_url": notify_url,
-            "name": client_id,
+            "name": client_id,  # This will be returned in webhook
             "success_redirect_url": f"{APP_BASE_URL}/pipeline/instagram-connection-success?client_id={client_id}",
             "failure_redirect_url": f"{APP_BASE_URL}/pipeline/instagram-connection-failed?client_id={client_id}"
         }
         
         logger.info(f"Generating Instagram hosted auth link for client {client_id}")
-        logger.info(f"Payload: {payload}")
         
         response = requests.post(
             f"{UNIPILE_DSN}/api/v1/hosted/accounts/link",
@@ -3585,25 +3594,14 @@ async def initiate_instagram_connection(client_id: str, redirect: bool = Query(T
             timeout=15
         )
         
-        logger.info(f"Unipile response status: {response.status_code}")
-        logger.info(f"Unipile response body: {response.text}")
-        
         if response.status_code not in [200, 201]:
-            try:
-                error_data = response.json()
-                error_msg = error_data.get("message", error_data.get("error", "Failed to generate auth link"))
-                logger.error(f"Unipile error details: {error_data}")
-            except:
-                error_msg = response.text or "Failed to generate auth link"
-            
-            logger.error(f"Unipile error: {response.status_code} - {error_msg}")
+            error_msg = response.json().get("message", "Failed to generate auth link")
             raise HTTPException(500, f"Unipile API error: {error_msg}")
         
         result = response.json()
         hosted_url = result.get("url")
         
         if not hosted_url:
-            logger.error(f"No URL in response: {result}")
             raise HTTPException(500, "No URL returned from Unipile")
         
         logger.info(f"✅ Generated Instagram hosted auth URL: {hosted_url}")
@@ -3616,66 +3614,70 @@ async def initiate_instagram_connection(client_id: str, redirect: bool = Query(T
                 "client_id": client_id,
                 "oauth_url": hosted_url,
                 "expires_at": expires_on,
-                "instructions": [
-                    "1. Open the 'oauth_url' in a browser",
-                    "2. Click 'Connect with Instagram'",
-                    "3. Log in with Instagram credentials",
-                    "4. After success, webhook will be called (needs ngrok for localhost)",
-                    "5. Check connection status with GET /pipeline/instagram-status/{client_id}"
-                ],
-                "webhook_url": notify_url,
-                "webhook_warning": "⚠️ Webhook won't work with localhost. Use ngrok for testing." if "localhost" in notify_url else None
+                "webhook_url": notify_url
             }
         
     except HTTPException:
         raise
-    except requests.RequestException as e:
-        logger.error(f"Network error: {str(e)}")
-        raise HTTPException(500, f"Failed to connect to Unipile: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
         raise HTTPException(500, f"Failed to initiate Instagram connection: {str(e)}")
 
 
+# In routers.py (document 5) - Update the instagram-webhook endpoint around line 133
+
 @router.post("/instagram-webhook")
 async def instagram_webhook(request: Request):
     """
     Webhook that receives account_id from Unipile after Instagram OAuth.
-    Automatically saves to database.
+    Automatically saves to MongoDB.
     """
     try:
         body = await request.body()
         
         if not body:
             return HTMLResponse(
-                content="<h1>Instagram Webhook Endpoint</h1><p>This endpoint receives POST requests from Unipile OAuth.</p>",
+                content="<h1>Instagram Webhook Endpoint</h1><p>Ready to receive POST requests from Unipile.</p>",
                 status_code=200
             )
         
         payload = json.loads(body)
-        logger.info(f"Instagram webhook received: {payload}")
+        logger.info(f"📨 Instagram webhook received: {payload}")
         
+        # Extract data from webhook
         status = payload.get("status")
         account_id = payload.get("account_id")
         client_id = payload.get("name")
         
         if not account_id or not client_id:
+            logger.error(f"Missing required fields in webhook: {payload}")
             return {"status": "error", "message": "Missing required fields"}
         
         if status not in ["CREATION_SUCCESS", "RECONNECTED"]:
+            logger.warning(f"Unexpected status in webhook: {status}")
             return {"status": "error", "message": f"Unexpected status: {status}"}
         
-        # Verify account with Unipile
-        headers = {"X-API-KEY": UNIPILE_API_TOKEN, "accept": "application/json"}
-        response = requests.get(f"{UNIPILE_DSN}/api/v1/accounts/{account_id}", headers=headers, timeout=10)
+        # Verify account with Unipile API
+        headers = {
+            "X-API-KEY": UNIPILE_API_TOKEN,
+            "accept": "application/json"
+        }
+        
+        response = requests.get(
+            f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
+            headers=headers,
+            timeout=10
+        )
         
         if response.status_code != 200:
+            logger.error(f"Account verification failed: {response.text}")
             return {"status": "error", "message": "Account verification failed"}
         
         account_data = response.json()
+        account_name = account_data.get("name") or account_data.get("username", "Unknown")
         
-        # Save to database
-        clients_collection.update_one(
+        # ✅ UPDATED: Save to MongoDB with proper status
+        result = clients_collection.update_one(
             {"client_id": client_id},
             {
                 "$set": {
@@ -3684,30 +3686,117 @@ async def instagram_webhook(request: Request):
                         "provider": "INSTAGRAM",
                         "is_active": True,
                         "connected_at": datetime.utcnow().isoformat(),
-                        "account_name": account_data.get("name"),
-                        "oauth_completed": True
-                    }
+                        "account_name": account_name,
+                        "username": account_data.get("username"),
+                        "oauth_completed": True,
+                        "status": "active",  # ✅ Set to active immediately
+                        "webhook_confirmed": True,  # ✅ Mark as confirmed
+                        "last_status_check": datetime.utcnow().isoformat()
+                    },
+                    "updated_at": datetime.utcnow().isoformat()
                 }
             }
         )
         
-        logger.info(f"✅ Instagram connected: {client_id} → {account_id}")
+        if result.modified_count > 0:
+            logger.info(f"✅ Instagram account saved to MongoDB: {client_id} → {account_id} (@{account_name})")
+        else:
+            logger.warning(f"⚠️ MongoDB update did not modify any documents for client_id: {client_id}")
         
         return {
             "status": "success",
             "client_id": client_id,
-            "account_id": account_id
+            "account_id": account_id,
+            "account_name": account_name
         }
         
     except Exception as e:
-        logger.error(f"Instagram webhook error: {str(e)}")
+        logger.error(f"❌ Instagram webhook error: {str(e)}", exc_info=True)
         return {"status": "error", "message": str(e)}
 
+@router.get("/instagram-status/{client_id}")
+async def get_instagram_status(client_id: str):
+    """
+    Get Instagram connection status from MongoDB
+    """
+    try:
+        # Fetch client from MongoDB
+        client = get_client_data(client_id)
+        
+        if not client:
+            raise HTTPException(404, f"Client not found: {client_id}")
+        
+        # Get Instagram data from MongoDB
+        instagram_data = client.get("instagram", {})
+        
+        if not instagram_data or not instagram_data.get("account_id"):
+            return {
+                "status": "pending",
+                "client_id": client_id,
+                "account_id": None,
+                "account_name": None,
+                "connected_at": None,
+                "message": "Instagram account not connected yet"
+            }
+        
+        account_id = instagram_data.get("account_id")
+        
+        # Optionally verify with Unipile API for fresh data
+        try:
+            headers = {
+                "X-API-KEY": UNIPILE_API_TOKEN,
+                "accept": "application/json"
+            }
+            
+            async with httpx.AsyncClient() as http_client:
+                response = await http_client.get(
+                    f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
+                    headers=headers,
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    account_data = response.json()
+                    # Update account name if it changed
+                    fresh_name = account_data.get("name") or account_data.get("username")
+                    
+                    if fresh_name and fresh_name != instagram_data.get("account_name"):
+                        clients_collection.update_one(
+                            {"client_id": client_id},
+                            {"$set": {"instagram.account_name": fresh_name}}
+                        )
+                        instagram_data["account_name"] = fresh_name
+                        
+        except Exception as e:
+            logger.warning(f"Could not fetch fresh account data from Unipile: {e}")
+        
+        return {
+            "status": "connected",
+            "client_id": client_id,
+            "account_id": instagram_data.get("account_id"),
+            "account_name": instagram_data.get("account_name", "Unknown"),
+            "username": instagram_data.get("username"),
+            "connected_at": instagram_data.get("connected_at"),
+            "is_active": instagram_data.get("is_active", True)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching Instagram status: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"Error fetching status: {str(e)}")
+
+
+# routers.py - Update this endpoint
 
 @router.get("/instagram-connection-success", response_class=HTMLResponse)
-async def instagram_connection_success_page(client_id: str = Query(...)):
+async def instagram_connection_success_page(
+    client_id: str = Query(...),
+    account_id: str = Query(None)  # ✅ Add this parameter
+):
     """
     Success page after Instagram OAuth completion.
+    Saves account_id to database if provided.
     """
     try:
         client = get_client_data(client_id)
@@ -3755,8 +3844,66 @@ async def instagram_connection_success_page(client_id: str = Query(...)):
                 status_code=404
             )
         
+        # ✅ NEW: If account_id is provided in URL, save it to database
+        if account_id:
+            logger.info(f"📨 Success redirect received with account_id: {account_id}")
+            
+            # Verify account with Unipile API
+            headers = {
+                "X-API-KEY": UNIPILE_API_TOKEN,
+                "accept": "application/json"
+            }
+            
+            try:
+                async with httpx.AsyncClient() as http_client:
+                    response = await http_client.get(
+                        f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
+                        headers=headers,
+                        timeout=10
+                    )
+                    
+                    if response.status_code == 200:
+                        account_data = response.json()
+                        account_name = account_data.get("name") or account_data.get("username", "Unknown")
+                        username = account_data.get("username")
+                        
+                        # ✅ Save to MongoDB
+                        result = clients_collection.update_one(
+                            {"client_id": client_id},
+                            {
+                                "$set": {
+                                    "instagram": {
+                                        "account_id": account_id,
+                                        "provider": "INSTAGRAM",
+                                        "is_active": True,
+                                        "connected_at": datetime.utcnow().isoformat(),
+                                        "account_name": account_name,
+                                        "username": username,
+                                        "oauth_completed": True,
+                                        "status": "active",  # ✅ Set to active
+                                        "webhook_confirmed": True,
+                                        "last_status_check": datetime.utcnow().isoformat()
+                                    },
+                                    "updated_at": datetime.utcnow().isoformat()
+                                }
+                            }
+                        )
+                        
+                        if result.modified_count > 0:
+                            logger.info(f"✅ Instagram account saved: {client_id} → {account_id} (@{username})")
+                        else:
+                            logger.warning(f"⚠️ MongoDB update did not modify any documents")
+                    else:
+                        logger.error(f"Failed to verify account: {response.status_code}")
+                        
+            except Exception as e:
+                logger.error(f"Error verifying account: {str(e)}")
+        
+        # Get current Instagram data (after potentially saving above)
+        client = get_client_data(client_id)  # Refresh client data
         instagram_data = client.get("instagram", {})
-        account_id = instagram_data.get("account_id", "Not yet connected")
+        
+        account_id_display = instagram_data.get("account_id", account_id or "Not yet connected")
         account_name = instagram_data.get("account_name", "Loading...")
         connected_at = instagram_data.get("connected_at", "Unknown")
         is_connected = instagram_data.get("oauth_completed", False)
@@ -3867,56 +4014,20 @@ async def instagram_connection_success_page(client_id: str = Query(...)):
                 
                 .status-badge {{
                     display: inline-block;
-                    background: #10b981;
-                    color: white;
                     padding: 4px 12px;
                     border-radius: 20px;
                     font-size: 12px;
                     font-weight: 600;
                 }}
                 
-                .next-steps {{
-                    background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
-                    border-left: 4px solid #3b82f6;
-                    padding: 25px;
-                    margin-top: 30px;
-                    text-align: left;
-                    border-radius: 8px;
+                .status-connected {{
+                    background: #10b981;
+                    color: white;
                 }}
                 
-                .next-steps h3 {{
-                    margin: 0 0 15px 0;
-                    color: #1e40af;
-                    font-size: 18px;
-                }}
-                
-                .next-steps ol {{
-                    margin: 15px 0;
-                    padding-left: 25px;
-                    color: #374151;
-                    line-height: 1.8;
-                }}
-                
-                .next-steps li {{
-                    margin-bottom: 8px;
-                }}
-                
-                .api-endpoint {{
-                    background: #1f2937;
-                    color: #10b981;
-                    padding: 12px;
-                    border-radius: 6px;
-                    font-family: 'Courier New', monospace;
-                    font-size: 13px;
-                    margin: 15px 0;
-                    overflow-x: auto;
-                }}
-                
-                .endpoint-label {{
-                    color: #9ca3af;
-                    font-size: 12px;
-                    margin-bottom: 5px;
-                    font-weight: 600;
+                .status-pending {{
+                    background: #f59e0b;
+                    color: white;
                 }}
                 
                 .close-note {{
@@ -3935,10 +4046,29 @@ async def instagram_connection_success_page(client_id: str = Query(...)):
                     margin-top: 20px;
                     font-weight: 600;
                     transition: background 0.3s;
+                    border: none;
+                    cursor: pointer;
                 }}
                 
                 .status-check-btn:hover {{
                     background: #c13584;
+                }}
+                
+                .loading {{
+                    display: inline-block;
+                    width: 16px;
+                    height: 16px;
+                    border: 2px solid #f3f3f3;
+                    border-top: 2px solid #e1306c;
+                    border-radius: 50%;
+                    animation: spin 1s linear infinite;
+                    margin-left: 8px;
+                    vertical-align: middle;
+                }}
+                
+                @keyframes spin {{
+                    0% {{ transform: rotate(0deg); }}
+                    100% {{ transform: rotate(360deg); }}
                 }}
             </style>
         </head>
@@ -3951,7 +4081,9 @@ async def instagram_connection_success_page(client_id: str = Query(...)):
                 <div class="info-box">
                     <div class="info-row">
                         <span class="info-label">Status</span>
-                        <span class="status-badge">{"✓ Connected" if is_connected else "⏳ Pending"}</span>
+                        <span class="status-badge {'status-connected' if is_connected else 'status-pending'}" id="status-badge">
+                            {"✓ Connected" if is_connected else "⏳ Pending"}
+                        </span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Client ID</span>
@@ -3959,47 +4091,78 @@ async def instagram_connection_success_page(client_id: str = Query(...)):
                     </div>
                     <div class="info-row">
                         <span class="info-label">Account ID</span>
-                        <span class="info-value">{account_id}</span>
+                        <span class="info-value" id="account-id">{account_id_display}</span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Account Name</span>
-                        <span class="info-value">{account_name}</span>
+                        <span class="info-value" id="account-name">{account_name}</span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Connected At</span>
-                        <span class="info-value">{connected_at[:19] if connected_at != "Unknown" else connected_at}</span>
+                        <span class="info-value" id="connected-at">{connected_at[:19] if connected_at != "Unknown" else connected_at}</span>
                     </div>
                 </div>
                 
-                <div class="next-steps">
-                    <h3>🚀 Next Steps</h3>
-                    <ol>
-                        <li><strong>Scrape prospects:</strong> Find Instagram profiles</li>
-                        <li><strong>Extract profiles:</strong> Get detailed profile information</li>
-                        <li><strong>Enrich with posts:</strong> Scrape their recent content</li>
-                        <li><strong>Generate messages:</strong> AI creates personalized DMs</li>
-                        <li><strong>Send automatically:</strong> Deliver messages via Instagram</li>
-                    </ol>
-                    
-                    <div class="endpoint-label">📍 Check Connection Status:</div>
-                    <div class="api-endpoint">
-                        GET /pipeline/instagram-status/{client_id}
-                    </div>
-                    
-                    <div class="endpoint-label">📍 Start Campaign:</div>
-                    <div class="api-endpoint">
-                        POST /pipeline/instagram/generate-and-send
-                    </div>
-                </div>
-                
-                <a href="/pipeline/instagram-status/{client_id}" class="status-check-btn" target="_blank">
+                <button onclick="checkStatus()" class="status-check-btn" id="check-btn">
                     Check Connection Status
-                </a>
+                </button>
                 
                 <p class="close-note">
                     You can close this window and return to your application.
                 </p>
             </div>
+            
+            <script>
+                const clientId = '{client_id}';
+                
+                async function checkStatus() {{
+                    const btn = document.getElementById('check-btn');
+                    btn.disabled = true;
+                    btn.innerHTML = 'Checking...<span class="loading"></span>';
+                    
+                    try {{
+                        const response = await fetch(`/pipeline/instagram-status/${{clientId}}`);
+                        const data = await response.json();
+                        
+                        console.log('Status check response:', data);
+                        
+                        if (data.account_id && data.account_id !== 'Not yet connected') {{
+                            document.getElementById('account-id').textContent = data.account_id;
+                            document.getElementById('account-name').textContent = data.account_name || 'Unknown';
+                            document.getElementById('connected-at').textContent = 
+                                data.connected_at ? data.connected_at.substring(0, 19) : 'Unknown';
+                            
+                            const badge = document.getElementById('status-badge');
+                            badge.textContent = '✓ Connected';
+                            badge.className = 'status-badge status-connected';
+                            
+                            btn.innerHTML = '✅ Connected Successfully!';
+                            btn.style.background = '#10b981';
+                            
+                            return true;
+                        }} else {{
+                            btn.innerHTML = '⏳ Still Pending...';
+                            setTimeout(() => {{
+                                btn.disabled = false;
+                                btn.innerHTML = 'Check Connection Status';
+                            }}, 2000);
+                            
+                            return false;
+                        }}
+                    }} catch (error) {{
+                        console.error('Error checking status:', error);
+                        btn.innerHTML = '❌ Error - Try Again';
+                        btn.disabled = false;
+                    }}
+                }}
+                
+                // Auto-check status on page load
+                window.onload = function() {{
+                    setTimeout(() => {{
+                        checkStatus();
+                    }}, 1000);
+                }};
+            </script>
         </body>
         </html>
         """
@@ -4009,8 +4172,6 @@ async def instagram_connection_success_page(client_id: str = Query(...)):
     except Exception as e:
         logger.error(f"Error rendering Instagram success page: {str(e)}")
         raise HTTPException(500, f"Error loading page: {str(e)}")
-
-
 
 from pydantic import BaseModel
 from typing import List
@@ -4429,7 +4590,6 @@ async def generate_instagram_messages(request: GenerateMessagesRequest):
     }
 
 
-# In your routes file, update the send_instagram_messages endpoint
 
 @router.post("/instagram/send-messages")
 async def send_instagram_messages(request: SendMessagesRequest):
@@ -4566,6 +4726,7 @@ async def send_instagram_messages(request: SendMessagesRequest):
         "failed": len(results) - sent_count,
         "results": results
     }
+
 
 @router.get("/instagram/prospects/{client_id}")
 async def get_instagram_prospects(client_id: str):
@@ -4711,3 +4872,4 @@ async def get_instagram_messages(client_id: str):
         "sent": sent,
         "pending": pending
     }
+
