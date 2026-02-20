@@ -1,18 +1,15 @@
-# webhooks/unipile.py
+# webhooks/unipile.py - FIXED VERSION
 
 from fastapi import APIRouter, Request
 import json
 import logging
 from datetime import datetime
 from db_config import clients_collection, audience_collection
+import os
 
 router = APIRouter(prefix="/pipeline/webhook", tags=["Webhooks"])
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# HELPER FUNCTION: Find client by account_id
-# ═══════════════════════════════════════════════════════════════════════
 
 def find_client_by_account_id(account_id: str):
     """
@@ -37,6 +34,69 @@ def find_client_by_account_id(account_id: str):
         platform = "linkedin"
     
     return client, platform
+
+
+def find_pending_connection(account_type: str):
+    """
+    Find the most recent pending connection for the given platform.
+    This is needed because Unipile overwrites the 'name' field with the profile name.
+    
+    Returns: client_id or None
+    """
+    from db_config import db
+    pending_connections_collection = db["pending_connections"]
+    
+    platform_name = account_type.lower()  # "LINKEDIN" -> "linkedin"
+    
+    # Find most recent pending connection for this platform
+    pending = pending_connections_collection.find_one(
+        {
+            "platform": platform_name,
+            "status": "pending"
+        },
+        sort=[("initiated_at", -1)]  # Most recent first
+    )
+    
+    if pending:
+        logger.info(f"✅ Found pending connection: {pending['client_id']}")
+        logger.info(f"   Initiated at: {pending.get('initiated_at')}")
+        return pending
+    
+    logger.warning(f"⚠️ No pending {platform_name} connection found in database")
+    return None
+
+
+def extract_client_id_from_account(account_details: dict, account_type: str) -> str:
+    """
+    Extract client_id from account details.
+    
+    Unipile overwrites the 'name' field with the LinkedIn/Instagram profile name,
+    so we need to:
+    1. Check 'name' field first (might work for some cases)
+    2. Look up pending connection in database
+    """
+    # Try to get from 'name' field first
+    name = account_details.get("name", "")
+    
+    # Check if name looks like a UUID (client_id format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+    if name and len(name) == 36 and name.count('-') == 4:
+        logger.info(f"✅ Found client_id in 'name' field: {name}")
+        return name
+    
+    # Name doesn't look like UUID - it's been overwritten by profile name
+    logger.warning(f"⚠️ 'name' field contains profile name, not client_id: {name}")
+    logger.warning(f"⚠️ Unipile overwrote the 'name' field with profile name")
+    logger.error("❌ Cannot extract client_id - Unipile overwrote the name field")
+    logger.error("💡 Workaround: Looking up pending connection in database...")
+    
+    # Look up in pending_connections table
+    pending = find_pending_connection(account_type)
+    
+    if pending:
+        return pending["client_id"]
+    
+    logger.error("❌ No pending connection found in database")
+    return None
 
 
 @router.post("/account-status")
@@ -69,7 +129,148 @@ async def unipile_account_status_webhook(request: Request):
         logger.info(f"📊 Event: {event}")
         logger.info(f"📊 Type: {account_type}")
         
-        # ✅ NEW: Verify account exists in our database
+        # ═══════════════════════════════════════════════════════════════════
+        # SPECIAL HANDLING FOR CREATION_SUCCESS - Account doesn't exist yet!
+        # ═══════════════════════════════════════════════════════════════════
+        if event == "CREATION_SUCCESS":
+            logger.info(f"🆕 New account created: {account_type}")
+            
+            # Fetch account details from Unipile
+            try:
+                import httpx
+                
+                UNIPILE_API_TOKEN = os.getenv("UNIPILE_API_TOKEN")
+                UNIPILE_DSN = os.getenv("UNIPILE_DSN")
+
+                # ✅ Fix: Ensure DSN has https:// protocol
+                if UNIPILE_DSN and not UNIPILE_DSN.startswith("http"):
+                    UNIPILE_DSN = f"https://{UNIPILE_DSN}"
+                
+                headers = {
+                    "X-API-KEY": UNIPILE_API_TOKEN,
+                    "accept": "application/json"
+                }
+                
+                async with httpx.AsyncClient() as http_client:
+                    response = await http_client.get(
+                        f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
+                        headers=headers,
+                        timeout=10
+                    )
+                    
+                    if response.status_code != 200:
+                        logger.error(f"❌ Failed to fetch account details: {response.text}")
+                        return {"status": "error", "message": "Could not fetch account details"}
+                    
+                    account_details = response.json()
+                    logger.info(f"📋 Account Details: {json.dumps(account_details, indent=2)}")
+                    
+                    # ✅ CRITICAL FIX: Extract client_id using pending connection lookup
+                    client_id = extract_client_id_from_account(account_details, account_type)
+                    
+                    if not client_id:
+                        logger.error("❌ Cannot extract client_id from account details")
+                        logger.error(f"   Account ID: {account_id}")
+                        logger.error(f"   Account Name: {account_details.get('name')}")
+                        logger.error("💡 Make sure /connect-linkedin or /connect-instagram stores pending connection BEFORE OAuth")
+                        
+                        return {
+                            "status": "error",
+                            "message": "Cannot determine which client this account belongs to",
+                            "hint": "Pending connection not found - ensure it's stored before OAuth redirect",
+                            "account_id": account_id,
+                            "account_name": account_details.get("name")
+                        }
+                    
+                    # Get username from account details
+                    account_username = "Unknown"
+                    account_name = account_details.get("name", "Unknown")
+                    
+                    connection_params = account_details.get("connection_params", {})
+                    if connection_params and "im" in connection_params:
+                        im_data = connection_params["im"]
+                        account_username = im_data.get("publicIdentifier", account_details.get("name", "Unknown"))
+                    
+                    logger.info(f"🔑 Client ID: {client_id}")
+                    logger.info(f"👤 Account username: {account_username}")
+                    
+                    # Verify client exists in database
+                    client = clients_collection.find_one({"client_id": client_id})
+                    if not client:
+                        logger.error(f"❌ Client {client_id} not found in database")
+                        return {"status": "error", "message": "Client not found"}
+                    
+                    # Determine platform field name
+                    platform_field = "instagram" if account_type == "INSTAGRAM" else "linkedin"
+                    
+                    # ✅ CRITICAL: Store account in MongoDB with all required fields
+                    result = clients_collection.update_one(
+                        {"client_id": client_id},
+                        {
+                            "$set": {
+                                f"{platform_field}": {
+                                    "account_id": account_id,
+                                    "provider": account_type,
+                                    "is_active": True,
+                                    "connected_at": datetime.utcnow().isoformat(),
+                                    "account_name": account_name,
+                                    "username": account_username,
+                                    "oauth_completed": True,
+                                    "status": "active",
+                                    "webhook_confirmed": True,
+                                    "last_webhook_event": event,
+                                    "last_status_check": datetime.utcnow().isoformat()
+                                },
+                                "updated_at": datetime.utcnow().isoformat()
+                            }
+                        }
+                    )
+                    
+                    if result.modified_count > 0:
+                        logger.info(f"✅✅✅ {platform_field.upper()} account saved: {client_id} → {account_id} (@{account_username})")
+                    else:
+                        logger.warning(f"⚠️ No changes made to client {client_id}")
+                    
+                    # ✅ Mark pending connection as completed
+                    from db_config import db
+                    pending_connections_collection = db["pending_connections"]
+                    
+                    pending_connections_collection.update_one(
+                        {
+                            "client_id": client_id,
+                            "platform": platform_field,
+                            "status": "pending"
+                        },
+                        {
+                            "$set": {
+                                "status": "completed",
+                                "completed_at": datetime.utcnow().isoformat(),
+                                "account_id": account_id,
+                                "account_name": account_name,
+                                "username": account_username
+                            }
+                        }
+                    )
+                    logger.info(f"✅ Marked pending connection as completed")
+                    
+                    return {
+                        "status": "success",
+                        "message": "Account created and linked successfully",
+                        "client_id": client_id,
+                        "account_id": account_id,
+                        "account_name": account_username,
+                        "platform": platform_field
+                    }
+                    
+            except Exception as e:
+                logger.error(f"❌ Error processing CREATION_SUCCESS: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                return {"status": "error", "message": str(e)}
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # FOR OTHER EVENTS: Verify account exists in our database
+        # ═══════════════════════════════════════════════════════════════════
         client, platform = find_client_by_account_id(account_id)
         
         if not client:
@@ -87,28 +288,7 @@ async def unipile_account_status_webhook(request: Request):
         # HANDLE DIFFERENT EVENTS
         # ═══════════════════════════════════════════════════════════════════
         
-        if event == "CREATION_SUCCESS":
-            logger.info(f"✅ Account connected successfully: {account_type}")
-            
-            result = clients_collection.update_one(
-                {f"{platform_field}.account_id": account_id},
-                {
-                    "$set": {
-                        f"{platform_field}.status": "active",
-                        f"{platform_field}.is_active": True,
-                        f"{platform_field}.last_webhook_event": event,
-                        f"{platform_field}.webhook_confirmed": True,
-                        f"{platform_field}.last_status_check": datetime.utcnow().isoformat()
-                    }
-                }
-            )
-            
-            if result.modified_count > 0:
-                logger.info(f"✅ Updated {platform_field} account {account_id} to active status")
-            else:
-                logger.info(f"   ℹ️  Account details will be stored by success endpoint")
-        
-        elif event == "DELETED":
+        if event == "DELETED":
             logger.info(f"❌ Account deleted: {account_type}")
             
             clients_collection.update_one(
@@ -220,7 +400,7 @@ async def unipile_account_status_webhook(request: Request):
 @router.post("/messaging")
 async def unipile_messaging_webhook(request: Request):
     """
-    Handles all messaging events:
+    Handles all messaging events for Instagram & LinkedIn:
     - message_received: New message/reply received OR sent message confirmation
     - message_read: Message was read
     - message_delivered: Message was delivered
@@ -243,14 +423,13 @@ async def unipile_messaging_webhook(request: Request):
         chat_id = payload.get("chat_id")
         timestamp = payload.get("timestamp")
         
-        # Get account_info to determine if message is from connected user
-        account_info = payload.get("account_info", {})
-        account_user_id = account_info.get("user_id")
-        
         # Get message text
         message_text = payload.get("message", "")
         if isinstance(message_text, dict):
             message_text = message_text.get("text", "")
+        
+        # Determine if this is a sent message (from connected account)
+        is_sender = payload.get("is_sender", False)
         
         # Get sender info
         sender = payload.get("sender", {})
@@ -264,9 +443,6 @@ async def unipile_messaging_webhook(request: Request):
             sender_provider_id = None
             sender_name = "Unknown"
             sender_username = ""
-        
-        # Determine if this is a sent message (from connected account)
-        is_sender = payload.get("is_sender", False)  # ✅ Use the is_sender flag from payload
         
         # Get recipient info (attendees)
         attendees = payload.get("attendees", [])
@@ -286,16 +462,14 @@ async def unipile_messaging_webhook(request: Request):
         logger.info(f"   Recipient: @{recipient_username}")
         logger.info(f"   Message: {message_text[:100]}...")
         
-        # ✅ NEW: Find client by account_id with verification
+        # Find client by account_id with verification
         client, platform = find_client_by_account_id(account_id)
         
         if not client:
             logger.warning(f"⚠️ Ignoring webhook from unknown account_id: {account_id}")
-            logger.warning(f"   This might be a duplicate/orphaned account")
             return {"status": "ignored", "reason": "unknown_account"}
         
         client_id = client["client_id"]
-        
         logger.info(f"   Client: {client_id} | Platform: {platform}")
         
         # ═══════════════════════════════════════════════════════════════════
@@ -306,6 +480,7 @@ async def unipile_messaging_webhook(request: Request):
         if event == "message_received" and not is_sender:
             logger.info(f"💬 REPLY RECEIVED from @{sender_username}")
             
+            # Update the specific prospect in the prospects array
             update_result = audience_collection.update_one(
                 {
                     "client_id": client_id,
@@ -319,7 +494,10 @@ async def unipile_messaging_webhook(request: Request):
                         "prospects.$.reply_at": timestamp,
                         "prospects.$.last_message": message_text[:500],
                         "prospects.$.last_reply_event": event,
-                        "prospects.$.status": "replied"  # ✅ Update status to replied
+                        "prospects.$.status": "replied",
+                        "prospects.$.chat_id": chat_id,  # Store chat_id
+                        "prospects.$.message_id": message_id,
+                        "updated_at": datetime.utcnow()
                     }
                 }
             )
@@ -331,27 +509,52 @@ async def unipile_messaging_webhook(request: Request):
         
         # 👀 MESSAGE READ BY RECIPIENT
         elif event == "message_read":
-            logger.info(f"👀 MESSAGE READ by @{recipient_username}")
+            logger.info(f"👀 MESSAGE READ event received")
             
-            if recipient_username:
-                update_result = audience_collection.update_one(
-                    {
-                        "client_id": client_id,
-                        "platform": platform,
-                        "type": "prospects",
-                        "prospects.username": recipient_username
-                    },
-                    {
-                        "$set": {
-                            "prospects.$.message_read": True,
-                            "prospects.$.read_at": timestamp,
-                            "prospects.$.status": "read"  # ✅ Update status to read
-                        }
+            # ✅ FIX: Find who read the message (exclude yourself)
+            read_by_username = None
+            
+            # Loop through all attendees
+            for attendee in attendees:
+                if isinstance(attendee, dict):
+                    attendee_id = attendee.get("attendee_provider_id")
+                    attendee_specs = attendee.get("attendee_specifics", {})
+                    attendee_username = attendee_specs.get("public_identifier", "")
+                    
+                    # Skip if this is YOUR connected account
+                    if attendee_id != account_id and attendee_username:
+                        read_by_username = attendee_username
+                        logger.info(f"   Found reader: @{read_by_username}")
+                        break
+            
+            if not read_by_username:
+                logger.error(f"❌ Could not find who read the message")
+                return {"status": "error"}
+            
+            logger.info(f"👀 MESSAGE READ by @{read_by_username}")
+            
+            # Update database
+            update_result = audience_collection.update_one(
+                {
+                    "client_id": client_id,
+                    "platform": platform,
+                    "type": "prospects",
+                    "prospects.username": read_by_username
+                },
+                {
+                    "$set": {
+                        "prospects.$.message_read": True,
+                        "prospects.$.read_at": timestamp,
+                        "prospects.$.status": "read",
+                        "updated_at": datetime.utcnow()
                     }
-                )
-                
-                if update_result.modified_count > 0:
-                    logger.info(f"✅ Updated read status for @{recipient_username}")
+                }
+            )
+            
+            if update_result.modified_count > 0:
+                logger.info(f"✅✅✅ Updated read status for @{read_by_username}")
+            else:
+                logger.warning(f"⚠️ Could not find prospect @{read_by_username}")
         
         # ✅ MESSAGE DELIVERED
         elif event == "message_delivered":
@@ -368,7 +571,9 @@ async def unipile_messaging_webhook(request: Request):
                     {
                         "$set": {
                             "prospects.$.message_delivered": True,
-                            "prospects.$.delivered_at": timestamp
+                            "prospects.$.delivered_at": timestamp,
+                            "prospects.$.status": "delivered",
+                            "updated_at": datetime.utcnow()
                         }
                     }
                 )
@@ -378,10 +583,10 @@ async def unipile_messaging_webhook(request: Request):
         
         # 📤 SENT MESSAGE CONFIRMATION (is_sender=True)
         elif event == "message_received" and is_sender:
-            logger.info(f"📤 SENT MESSAGE CONFIRMATION")
+            logger.info(f"📤 SENT MESSAGE CONFIRMATION to @{recipient_username}")
             
-            # Confirm pending messages
             if recipient_username:
+                # Confirm pending messages
                 update_result = audience_collection.update_one(
                     {
                         "client_id": client_id,
@@ -395,7 +600,9 @@ async def unipile_messaging_webhook(request: Request):
                             "prospects.$.status": "sent",
                             "prospects.$.confirmed_at": timestamp,
                             "prospects.$.message_id": message_id,
-                            "prospects.$.webhook_confirmed": True
+                            "prospects.$.chat_id": chat_id,
+                            "prospects.$.webhook_confirmed": True,
+                            "updated_at": datetime.utcnow()
                         },
                         "$unset": {
                             "prospects.$.warning": ""
@@ -405,31 +612,58 @@ async def unipile_messaging_webhook(request: Request):
                 
                 if update_result.modified_count > 0:
                     logger.info(f"✅✅ CONFIRMED pending message for @{recipient_username}")
-            
-            # Check for error messages from Instagram
-            if "can't receive your message" in message_text.lower() or "don't allow new message requests" in message_text.lower():
-                logger.warning(f"⚠️ MESSAGE REJECTED by Instagram: {message_text}")
-                
-                if recipient_username:
+                else:
+                    # Try updating any sent message (fallback)
                     update_result = audience_collection.update_one(
                         {
                             "client_id": client_id,
                             "platform": platform,
                             "type": "prospects",
-                            "prospects.username": recipient_username
+                            "prospects.username": recipient_username,
+                            "prospects.status": {"$in": ["sent", "queued"]}
                         },
                         {
                             "$set": {
-                                "prospects.$.message_failed": True,
-                                "prospects.$.failure_reason": "Message requests not allowed",
-                                "prospects.$.failed_at": timestamp,
-                                "prospects.$.status": "failed"
+                                "prospects.$.status": "confirmed_sent",
+                                "prospects.$.confirmed_at": timestamp,
+                                "prospects.$.message_id": message_id,
+                                "prospects.$.chat_id": chat_id,
+                                "prospects.$.webhook_confirmed": True,
+                                "updated_at": datetime.utcnow()
                             }
                         }
                     )
                     
                     if update_result.modified_count > 0:
-                        logger.info(f"✅ Updated failure status for @{recipient_username}")
+                        logger.info(f"✅ Confirmed existing sent message for @{recipient_username}")
+        
+        # 💙 MESSAGE REACTION
+        elif event == "message_reaction":
+            reaction = payload.get("reaction", {})
+            reaction_type = reaction.get("type", "unknown") if isinstance(reaction, dict) else "unknown"
+            
+            logger.info(f"💙 MESSAGE REACTION: {reaction_type} from @{sender_username}")
+            
+            if sender_username:
+                update_result = audience_collection.update_one(
+                    {
+                        "client_id": client_id,
+                        "platform": platform,
+                        "type": "prospects",
+                        "prospects.username": sender_username
+                    },
+                    {
+                        "$set": {
+                            "prospects.$.has_reaction": True,
+                            "prospects.$.reaction_type": reaction_type,
+                            "prospects.$.reaction_at": timestamp,
+                            "updated_at": datetime.utcnow()
+                        }
+                    }
+                )
+                
+                if update_result.modified_count > 0:
+                    logger.info(f"✅ Updated reaction for @{sender_username}")
         
         return {"status": "ok", "processed": True}
         
@@ -441,7 +675,6 @@ async def unipile_messaging_webhook(request: Request):
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": str(e)}
-
 
 @router.post("/users")
 async def unipile_users_webhook(request: Request):
@@ -462,7 +695,7 @@ async def unipile_users_webhook(request: Request):
         event = payload.get("event")
         account_id = payload.get("account_id")
         
-        # ✅ NEW: Verify account exists in our database
+        # ✅ Verify account exists in our database
         client, platform = find_client_by_account_id(account_id)
         
         if not client:

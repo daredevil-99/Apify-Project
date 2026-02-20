@@ -502,7 +502,7 @@ def scrape_linkedin(search_terms: List[str], profession: str = None, location: s
             "searchQuery": search_query,
             "profileScraperMode": "Short",  # Valid options: "Short", "Full", "Full + email search"
             "startPage": 1,
-            "maxItems": 25,  # Free tier limit
+            "maxItems": 10,  # Free tier limit
             "proxyConfigurationOptions": {"useApifyProxy": True}
         }
         

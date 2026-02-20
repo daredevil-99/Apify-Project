@@ -1,38 +1,26 @@
 # scheduler.py
 
-import logging
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-
-from jobs.no_reply_48h import mark_no_reply_after_48h
+from jobs.no_reply_48h import mark_no_reply_all_platforms_48h  # ← Changed import
+import logging
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
-
-scheduler = BackgroundScheduler()
 
 
 def start_scheduler():
-    """
-    Starts APScheduler and registers background jobs
-    """
-
-    if scheduler.running:
-        logger.warning("⚠️ Scheduler already running")
-        return
-
+    """Start background job scheduler"""
+    scheduler = BackgroundScheduler()
+    
+    # Run every 6 hours - checks both Instagram AND LinkedIn
     scheduler.add_job(
-        mark_no_reply_after_48h,
-        trigger=IntervalTrigger(hours=1),
-        id="no_reply_48h_job",
-        name="Mark no-reply after 48h",
-        replace_existing=True,
-        max_instances=1,
-        misfire_grace_time=3600
+        mark_no_reply_all_platforms_48h,  # ← Changed function name
+        'interval',
+        hours=6,
+        id='no_reply_48h_all_platforms',
+        replace_existing=True
     )
-
+    
     scheduler.start()
-    logger.info("✅ APScheduler started | no_reply_48h job registered")
+    logger.info("✅ Scheduler started - Running no_reply_48h job every 6 hours for Instagram + LinkedIn")
+    
+    return scheduler

@@ -479,16 +479,14 @@ async def initiate_linkedin_connection(client_id: str, redirect: bool = Query(Tr
         # Link expires in 1 hour - MUST use .000Z format (3 decimal places)
         expires_on = (datetime.utcnow() + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
         
-        # Webhook URL where Unipile will notify us after successful connection
-        notify_url = f"{APP_BASE_URL}/pipeline/linkedin-webhook"
-        
-        # ✅ CORRECT payload with all required fields
+        notify_url = f"{APP_BASE_URL}/pipeline/webhook/account-status"  # Match your webhook handler
+    
         payload = {
-            "type": "create",  # REQUIRED: "create" or "reconnect"
-            "api_url": UNIPILE_DSN,  # REQUIRED: Your Unipile server URL
-            "providers": ["LINKEDIN"],  # REQUIRED
-            "expiresOn": expires_on,  # REQUIRED: ISO 8601 with .000Z format
-            "notify_url": notify_url,
+            "type": "create",
+            "api_url": UNIPILE_DSN,
+            "providers": ["LINKEDIN"],
+            "expiresOn": expires_on,
+            "notify_url": notify_url,  # Now points to correct endpoint
             "name": client_id,
             "success_redirect_url": f"{APP_BASE_URL}/pipeline/connection-success?client_id={client_id}",
             "failure_redirect_url": f"{APP_BASE_URL}/pipeline/connection-failed?client_id={client_id}"
@@ -528,6 +526,38 @@ async def initiate_linkedin_connection(client_id: str, redirect: bool = Query(Tr
         
         logger.info(f"✅ Generated hosted auth URL: {hosted_url}")
         
+        # ✅✅✅ CRITICAL FIX: Store pending connection in database BEFORE user clicks link
+        # This is how we'll know which client_id to map to when the webhook arrives
+        from db_config import db
+        pending_connections_collection = db["pending_connections"]
+        
+        # First, mark any existing pending connections for this client as expired
+        pending_connections_collection.update_many(
+            {
+                "client_id": client_id,
+                "platform": "linkedin",
+                "status": "pending"
+            },
+            {
+                "$set": {
+                    "status": "expired",
+                    "expired_at": datetime.utcnow().isoformat()
+                }
+            }
+        )
+        
+        # Now store the new pending connection
+        pending_connections_collection.insert_one({
+            "client_id": client_id,
+            "platform": "linkedin",
+            "status": "pending",
+            "initiated_at": datetime.utcnow().isoformat(),
+            "expires_at": expires_on,
+            "oauth_url": hosted_url
+        })
+        
+        logger.info(f"✅✅✅ Stored pending connection for client: {client_id}")
+        
         # Return JSON or redirect based on query parameter
         if redirect:
             # Browser-friendly: Auto-redirect to Unipile
@@ -543,11 +573,11 @@ async def initiate_linkedin_connection(client_id: str, redirect: bool = Query(Tr
                     "1. Open the 'oauth_url' in a browser",
                     "2. Click 'Connect with LinkedIn'",
                     "3. Log in with LinkedIn credentials",
-                    "4. After success, webhook will be called (needs ngrok for localhost)",
+                    "4. After success, webhook will be called",
                     "5. Check connection status with GET /pipeline/linkedin-status/{client_id}"
                 ],
                 "webhook_url": notify_url,
-                "webhook_warning": "⚠️ Webhook won't work with localhost. Use ngrok for testing." if "localhost" in notify_url else None
+                "note": "Pending connection stored - webhook will map account_id to this client_id"
             }
         
     except HTTPException:
@@ -563,43 +593,55 @@ async def initiate_linkedin_connection(client_id: str, redirect: bool = Query(Tr
 @router.post("/linkedin-webhook")
 async def linkedin_webhook(request: Request):
     """
-    Webhook that receives account_id from Unipile after OAuth.
-    Automatically saves to database.
+    Webhook that receives account_id from Unipile after LinkedIn OAuth.
+    Automatically saves to MongoDB.
     """
     try:
         body = await request.body()
         
         if not body:
             return HTMLResponse(
-                content="<h1>Webhook Endpoint</h1><p>This endpoint receives POST requests from Unipile OAuth.</p>",
+                content="<h1>LinkedIn Webhook Endpoint</h1><p>Ready to receive POST requests from Unipile.</p>",
                 status_code=200
             )
         
         payload = json.loads(body)
-        logger.info(f"Webhook received: {payload}")
+        logger.info(f"📨 LinkedIn webhook received: {payload}")
         
+        # Extract data from webhook
         status = payload.get("status")
         account_id = payload.get("account_id")
         client_id = payload.get("name")
         
         if not account_id or not client_id:
+            logger.error(f"Missing required fields in webhook: {payload}")
             return {"status": "error", "message": "Missing required fields"}
         
         if status not in ["CREATION_SUCCESS", "RECONNECTED"]:
+            logger.warning(f"Unexpected status in webhook: {status}")
             return {"status": "error", "message": f"Unexpected status: {status}"}
         
-        # Verify account
-        import requests
-        headers = {"X-API-KEY": UNIPILE_API_TOKEN, "accept": "application/json"}
-        response = requests.get(f"{UNIPILE_DSN}/api/v1/accounts/{account_id}", headers=headers, timeout=10)
+        # Verify account with Unipile API
+        headers = {
+            "X-API-KEY": UNIPILE_API_TOKEN,
+            "accept": "application/json"
+        }
+        
+        response = requests.get(
+            f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
+            headers=headers,
+            timeout=10
+        )
         
         if response.status_code != 200:
+            logger.error(f"Account verification failed: {response.text}")
             return {"status": "error", "message": "Account verification failed"}
         
         account_data = response.json()
+        account_name = account_data.get("name") or "Unknown"
         
-        # Save to database
-        clients_collection.update_one(
+        # ✅ UPDATED: Save to MongoDB with ALL fields (matching Instagram)
+        result = clients_collection.update_one(
             {"client_id": client_id},
             {
                 "$set": {
@@ -608,27 +650,34 @@ async def linkedin_webhook(request: Request):
                         "provider": "LINKEDIN",
                         "is_active": True,
                         "connected_at": datetime.utcnow().isoformat(),
-                        "account_name": account_data.get("name"),
-                        "oauth_completed": True
-                    }
+                        "account_name": account_name,
+                        "username": account_data.get("username"),  # ✅ Added
+                        "oauth_completed": True,
+                        "status": "active",  # ✅ Added - Set to active immediately
+                        "webhook_confirmed": True,  # ✅ Added - Mark as confirmed
+                        "last_status_check": datetime.utcnow().isoformat()  # ✅ Added
+                    },
+                    "updated_at": datetime.utcnow().isoformat()
                 }
             }
         )
         
-        logger.info(f"✅ LinkedIn connected: {client_id} → {account_id}")
+        if result.modified_count > 0:
+            logger.info(f"✅ LinkedIn account saved to MongoDB: {client_id} → {account_id} (@{account_name})")
+        else:
+            logger.warning(f"⚠️ MongoDB update did not modify any documents for client_id: {client_id}")
         
         return {
             "status": "success",
             "client_id": client_id,
-            "account_id": account_id
+            "account_id": account_id,
+            "account_name": account_name
         }
         
     except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
+        logger.error(f"❌ LinkedIn webhook error: {str(e)}", exc_info=True)
         return {"status": "error", "message": str(e)}
-
-# Add these endpoints to your routes.py after the webhook endpoint
-
+    
 @router.get("/connection-success", response_class=HTMLResponse)
 async def connection_success_page(client_id: str = Query(...)):
     """
@@ -1155,22 +1204,25 @@ async def connection_failed_page(
 async def check_linkedin_status(client_id: str):
     """
     Check if LinkedIn account is connected and active.
-    Also verifies the account with Unipile API.
     """
     try:
         client = get_client_data(client_id)
         if not client:
             raise HTTPException(404, "Client not found")
         
+        # Get LinkedIn data from MongoDB
         linkedin_data = client.get("linkedin", {})
         
-        # Not connected at all
-        if not linkedin_data or not linkedin_data.get("is_active"):
+        # ✅ Check if account is connected
+        if not linkedin_data or not linkedin_data.get("account_id"):
             return {
                 "connected": False,
                 "status": "not_connected",
                 "message": "LinkedIn not connected",
                 "client_id": client_id,
+                "account_id": None,
+                "account_name": None,
+                "connected_at": None,
                 "connect_url": f"{APP_BASE_URL}/pipeline/connect-linkedin/{client_id}",
                 "instructions": [
                     "1. Visit the connect_url to start OAuth flow",
@@ -1182,55 +1234,47 @@ async def check_linkedin_status(client_id: str):
         
         account_id = linkedin_data.get("account_id")
         
-        # Verify with Unipile API
-        import requests
-        headers = {
-            "X-API-KEY": UNIPILE_API_TOKEN,
-            "accept": "application/json"
-        }
-        
+        # Optionally verify with Unipile API for fresh data
         try:
-            response = requests.get(
-                f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
-                headers=headers,
-                timeout=10
-            )
+            headers = {
+                "X-API-KEY": UNIPILE_API_TOKEN,
+                "accept": "application/json"
+            }
             
-            account_valid = response.status_code == 200
-            
-            if account_valid:
-                account_info = response.json()
-                provider_status = account_info.get("status", "unknown")
-            else:
-                provider_status = "verification_failed"
+            async with httpx.AsyncClient() as http_client:
+                response = await http_client.get(
+                    f"{UNIPILE_DSN}/api/v1/accounts/{account_id}",
+                    headers=headers,
+                    timeout=10
+                )
                 
-        except requests.RequestException as e:
-            logger.error(f"Unipile verification failed: {str(e)}")
-            account_valid = False
-            provider_status = "network_error"
+                if response.status_code == 200:
+                    account_data = response.json()
+                    # Update account name if it changed
+                    fresh_name = account_data.get("name")
+                    
+                    if fresh_name and fresh_name != linkedin_data.get("account_name"):
+                        clients_collection.update_one(
+                            {"client_id": client_id},
+                            {"$set": {"linkedin.account_name": fresh_name}}
+                        )
+                        linkedin_data["account_name"] = fresh_name
+                        
+        except Exception as e:
+            logger.warning(f"Could not fetch fresh account data from Unipile: {e}")
         
+        # ✅ Return connected status
         return {
             "connected": True,
-            "status": "active" if account_valid else "inactive",
+            "status": "connected",
             "client_id": client_id,
-            "account_id": account_id,
-            "account_name": linkedin_data.get("account_name"),
-            "provider": linkedin_data.get("provider"),
+            "account_id": linkedin_data.get("account_id"),
+            "account_name": linkedin_data.get("account_name", "Unknown"),
+            "username": linkedin_data.get("username"),
             "connected_at": linkedin_data.get("connected_at"),
-            "oauth_completed": linkedin_data.get("oauth_completed", False),
-            "account_valid": account_valid,
-            "provider_status": provider_status,
-            "message": "✅ LinkedIn connected and active" if account_valid else "⚠️ LinkedIn connected but account may be inactive",
-            "ready_to_send": account_valid,
-            "next_steps": [
-                "1. POST /pipeline/scrape/{client_id} - Scrape prospects",
-                "2. POST /pipeline/extract-prospects/{client_id} - Extract profiles",
-                "3. POST /pipeline/enrich-posts - Enrich with posts",
-                "4. POST /pipeline/generate-and-send - Generate & send messages"
-            ] if account_valid else [
-                "Connection may be inactive. Try reconnecting:",
-                f"GET /pipeline/connect-linkedin/{client_id}"
-            ]
+            "is_active": linkedin_data.get("is_active", True),
+            "webhook_confirmed": linkedin_data.get("webhook_confirmed", False),
+            "status_field": linkedin_data.get("status", "unknown")
         }
         
     except HTTPException:
@@ -1238,7 +1282,7 @@ async def check_linkedin_status(client_id: str):
     except Exception as e:
         logger.error(f"Status check error: {str(e)}")
         raise HTTPException(500, f"Failed to check status: {str(e)}")
-    
+        
 
 @router.post("/generate-messages")
 async def generate_messages_only(request: GenerateMessagesRequest):

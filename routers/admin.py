@@ -2,6 +2,7 @@
 """
 Admin endpoints for account management and debugging
 Users only need to know their client_id
+⭐ UPDATED: Now supports both Instagram and LinkedIn
 """
 
 from fastapi import APIRouter, HTTPException
@@ -44,6 +45,9 @@ async def get_client_accounts(client_id: str):
     }
     """
     try:
+        # ⭐ UPDATED: Strip spaces
+        client_id = client_id.strip()
+        
         client = clients_collection.find_one({"client_id": client_id})
         
         if not client:
@@ -105,6 +109,9 @@ async def check_client_duplicates(client_id: str):
     }
     """
     try:
+        # ⭐ UPDATED: Strip spaces
+        client_id = client_id.strip()
+        
         # Get client's registered accounts
         client = clients_collection.find_one({"client_id": client_id})
         
@@ -160,6 +167,9 @@ async def cleanup_client_duplicates(client_id: str, platform: str = "instagram")
     2. Delete all other accounts of same type from Unipile
     """
     try:
+        # ⭐ UPDATED: Strip spaces
+        client_id = client_id.strip()
+        
         if platform not in ["instagram", "linkedin"]:
             raise HTTPException(status_code=400, detail="Platform must be 'instagram' or 'linkedin'")
         
@@ -229,21 +239,28 @@ async def get_client_prospect_stats(client_id: str, platform: str = "instagram")
     """
     Get prospect statistics for a client
     GET /admin/client/{client_id}/prospects/stats?platform=instagram
+    GET /admin/client/{client_id}/prospects/stats?platform=linkedin
+    
+    ⭐ UPDATED: Now supports both Instagram and LinkedIn
     
     Returns detailed tracking stats:
     - Total prospects
     - Sent/Read/Replied counts
     - Read rate & Reply rate
     - No reply after 48h
+    - Connection rate (LinkedIn only)
     """
     try:
+        # ⭐ UPDATED: Strip spaces from client_id
+        client_id = client_id.strip()
+        
         if platform not in ["instagram", "linkedin"]:
             raise HTTPException(status_code=400, detail="Platform must be 'instagram' or 'linkedin'")
         
         # Verify client exists
         client = clients_collection.find_one({"client_id": client_id})
         if not client:
-            raise HTTPException(status_code=404, detail="Client not found")
+            raise HTTPException(status_code=404, detail=f"Client not found: {client_id}")
         
         # Get prospects
         audience_doc = audience_collection.find_one({
@@ -272,13 +289,28 @@ async def get_client_prospect_stats(client_id: str, platform: str = "instagram")
         
         prospects = audience_doc.get("prospects", [])
         
-        # Calculate stats
+        # ⭐ UPDATED: Calculate stats (works for both platforms)
         total = len(prospects)
-        sent = sum(1 for p in prospects if p.get("status") in ["sent", "read", "replied", "confirmed_sent"])
+        
+        # For Instagram: status in ["sent", "read", "replied", "confirmed_sent"]
+        # For LinkedIn: status in ["invitation_sent", "connected", "read", "replied"]
+        if platform == "instagram":
+            sent = sum(1 for p in prospects if p.get("status") in ["sent", "read", "replied", "confirmed_sent"])
+        else:  # linkedin
+            sent = sum(1 for p in prospects if p.get("status") in ["invitation_sent", "connected", "read", "replied"])
+        
         read = sum(1 for p in prospects if p.get("message_read") is True)
         replied = sum(1 for p in prospects if p.get("replied") is True)
         no_reply_48h = sum(1 for p in prospects if p.get("status") == "no_reply_48h")
         failed = sum(1 for p in prospects if p.get("message_failed") is True)
+        
+        # ⭐ NEW: LinkedIn-specific metrics
+        if platform == "linkedin":
+            connected = sum(1 for p in prospects if p.get("connection_accepted") is True)
+            invitation_sent = sum(1 for p in prospects if p.get("status") in ["invitation_sent", "connected", "read", "replied"])
+            connection_rate = round((connected / invitation_sent * 100), 2) if invitation_sent > 0 else 0
+        else:
+            connection_rate = None
         
         stats = {
             "total": total,
@@ -291,11 +323,16 @@ async def get_client_prospect_stats(client_id: str, platform: str = "instagram")
             "reply_rate": round((replied / sent * 100), 2) if sent > 0 else 0
         }
         
-        # Return detailed prospect info
+        # ⭐ NEW: Add LinkedIn-specific stats
+        if connection_rate is not None:
+            stats["connected"] = connected
+            stats["invitation_sent"] = invitation_sent
+            stats["connection_rate"] = connection_rate
+        
+        # ⭐ UPDATED: Format prospect details (platform-specific fields)
         prospect_details = []
         for p in prospects:
-            prospect_details.append({
-                "username": p.get("username"),
+            detail = {
                 "status": p.get("status", "unknown"),
                 "sent_at": p.get("sent_at"),
                 "read_at": p.get("read_at"),
@@ -303,7 +340,19 @@ async def get_client_prospect_stats(client_id: str, platform: str = "instagram")
                 "message_read": p.get("message_read", False),
                 "replied": p.get("replied", False),
                 "last_message": p.get("last_message", "")[:100]  # First 100 chars
-            })
+            }
+            
+            # Platform-specific fields
+            if platform == "instagram":
+                detail["username"] = p.get("username")
+            else:  # linkedin
+                detail["name"] = p.get("name")
+                detail["profile_url"] = p.get("profile_url")
+                detail["provider_id"] = p.get("provider_id")
+                detail["connection_accepted"] = p.get("connection_accepted", False)
+                detail["accepted_at"] = p.get("accepted_at")
+            
+            prospect_details.append(detail)
         
         return {
             "success": True,
@@ -315,7 +364,7 @@ async def get_client_prospect_stats(client_id: str, platform: str = "instagram")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting prospect stats: {e}")
+        logger.error(f"Error getting prospect stats: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -325,16 +374,21 @@ async def check_tracking_health(client_id: str):
     Check if tracking is working correctly for this client
     GET /admin/client/{client_id}/tracking-health
     
+    ⭐ UPDATED: Now checks both Instagram and LinkedIn
+    
     Checks:
     - Are accounts connected?
     - Are webhooks being received?
     - Are there duplicate accounts causing issues?
     """
     try:
+        # ⭐ UPDATED: Strip spaces
+        client_id = client_id.strip()
+        
         client = clients_collection.find_one({"client_id": client_id})
         
         if not client:
-            raise HTTPException(status_code=404, detail="Client not found")
+            raise HTTPException(status_code=404, detail=f"Client not found: {client_id}")
         
         health = {
             "client_id": client_id,
@@ -365,7 +419,7 @@ async def check_tracking_health(client_id: str):
             
             health["instagram"] = insta_health
         
-        # Check LinkedIn
+        # ⭐ UPDATED: Check LinkedIn with OAuth status
         if "linkedin" in client and client["linkedin"].get("account_id"):
             linkedin = client["linkedin"]
             linkedin_health = {
@@ -373,11 +427,17 @@ async def check_tracking_health(client_id: str):
                 "account_id": linkedin.get("account_id"),
                 "is_active": linkedin.get("is_active", False),
                 "last_webhook": linkedin.get("last_status_check"),
-                "webhook_confirmed": linkedin.get("webhook_confirmed", False)
+                "webhook_confirmed": linkedin.get("webhook_confirmed", False),
+                "oauth_completed": linkedin.get("oauth_completed", False)  # ⭐ NEW
             }
             
             if not linkedin.get("is_active"):
                 health["issues"].append("LinkedIn account is not active")
+                health["overall_health"] = "unhealthy"
+            
+            # ⭐ NEW: Check OAuth status
+            if not linkedin.get("oauth_completed"):
+                health["issues"].append("LinkedIn OAuth not completed")
                 health["overall_health"] = "unhealthy"
             
             if not linkedin.get("webhook_confirmed"):
@@ -398,16 +458,91 @@ async def check_tracking_health(client_id: str):
             health["issues"].append(f"Multiple LinkedIn accounts detected ({len(linkedin_accounts)} total)")
             health["overall_health"] = "unhealthy"
         
+        # Determine overall health
         if len(health["issues"]) == 0 and len(health["warnings"]) == 0:
             health["overall_health"] = "healthy"
         elif len(health["issues"]) == 0:
             health["overall_health"] = "warning"
+        else:
+            health["overall_health"] = "unhealthy"
         
         return health
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error checking tracking health: {e}")
+        logger.error(f"Error checking tracking health: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ⭐ NEW ENDPOINT: Tracking Status
+@router.get("/pipeline/tracking-status/{client_id}")
+async def get_tracking_status(client_id: str, platform: str = "instagram"):
+    """
+    Get tracking status for a client
+    GET /pipeline/tracking-status/{client_id}?platform=instagram
+    GET /pipeline/tracking-status/{client_id}?platform=linkedin
+    
+    ⭐ NEW: Supports both platforms
+    This endpoint matches the URL format from your logs
+    """
+    try:
+        # Remove leading/trailing spaces (your URL had %20 which is a space)
+        client_id = client_id.strip()
+        
+        if platform not in ["instagram", "linkedin"]:
+            raise HTTPException(status_code=400, detail="Platform must be 'instagram' or 'linkedin'")
+        
+        # Verify client exists
+        client = clients_collection.find_one({"client_id": client_id})
+        if not client:
+            raise HTTPException(status_code=404, detail=f"Client not found: {client_id}")
+        
+        # Check if platform is connected
+        platform_data = client.get(platform, {})
+        
+        if not platform_data or not platform_data.get("account_id"):
+            return {
+                "success": False,
+                "client_id": client_id,
+                "platform": platform,
+                "connected": False,
+                "message": f"{platform.capitalize()} account not connected"
+            }
+        
+        # Get tracking stats
+        audience_doc = audience_collection.find_one({
+            "client_id": client_id,
+            "platform": platform,
+            "type": "prospects"
+        })
+        
+        if not audience_doc:
+            return {
+                "success": True,
+                "client_id": client_id,
+                "platform": platform,
+                "connected": True,
+                "tracking_active": False,
+                "message": f"No {platform} prospects being tracked yet"
+            }
+        
+        prospects = audience_doc.get("prospects", [])
+        
+        return {
+            "success": True,
+            "client_id": client_id,
+            "platform": platform,
+            "connected": True,
+            "tracking_active": True,
+            "total_prospects": len(prospects),
+            "last_updated": audience_doc.get("last_updated"),
+            "message": f"Tracking {len(prospects)} {platform} prospects"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting tracking status: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
